@@ -54,6 +54,8 @@ declare global {
       
       runAdbCommand: (deviceId: string, command: string) => Promise<{success: boolean, output?: string, error?: string}>;
       openSettings: (deviceId: string, intent: 'wifi' | 'ime' | 'accessibility') => Promise<{success: boolean, error?: string}>;
+      saveTestAccountPassword: (accountId: string, password: string) => Promise<{success: boolean, error?: string}>;
+      getTestAccountPassword: (accountId: string) => Promise<{success: boolean, password?: string, error?: string}>;
     };
   }
 }

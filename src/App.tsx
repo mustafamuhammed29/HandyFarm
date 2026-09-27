@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { 
   Smartphone, XCircle, Play, CheckSquare, Square, RefreshCw, Link as LinkIcon, Download, RotateCcw, 
   Moon, Sun, Pin, PinOff, Settings, Search, LayoutGrid, Monitor, 
-  Tag, Terminal, Camera, Power, FileUp, FileDown, Save, Key
+  Tag, Terminal, Camera, Power, FileUp, FileDown, Save, Key, History
 } from 'lucide-react';
 import './App.css';
 import type { DeviceData, QuickPhrase, TestAccount } from './types';
@@ -43,6 +43,7 @@ function App() {
   // Settings Modal
   const [settingsDevice, setSettingsDevice] = useState<DeviceData | null>(null);
   const [settingsForm, setSettingsForm] = useState({ customName: '', notes: '', isBareBoard: false, tags: '' });
+  const [historyDevice, setHistoryDevice] = useState<DeviceData | null>(null);
 
   useEffect(() => {
     const savedTheme = localStorage.getItem('theme') as 'dark' | 'light' | null;
@@ -51,7 +52,29 @@ function App() {
     if (savedPhrases) setQuickPhrases(JSON.parse(savedPhrases));
     const savedAccounts = localStorage.getItem('testAccounts');
     if (savedAccounts) {
-      setTestAccounts(JSON.parse(savedAccounts));
+      const parsed = JSON.parse(savedAccounts) as TestAccount[];
+      let migratedCount = 0;
+      let needsSave = false;
+
+      Promise.all(parsed.map(async (acc) => {
+        if (acc.password) {
+          const res = await window.electronAPI.saveTestAccountPassword(acc.id, acc.password);
+          if (!res.success) {
+            alert(`Migration failed for account ${acc.id}: ${res.error}`);
+            // Do not delete password if migration failed
+          } else {
+            delete acc.password;
+            migratedCount++;
+            needsSave = true;
+          }
+        }
+      })).then(() => {
+        if (needsSave) {
+          console.log(`Migrated ${migratedCount} accounts to secure storage.`);
+          localStorage.setItem('testAccounts', JSON.stringify(parsed));
+        }
+        setTestAccounts(parsed);
+      });
     } else {
       // Default initial mock accounts if none exist
       const defaultAccounts = [
@@ -548,6 +571,9 @@ function App() {
                       </div>
                       <div style={{display: 'flex', gap: '4px'}}>
                         {device.tags && device.tags.length > 0 && <Tag size={12} color="var(--accent)" />}
+                        <button className="icon-btn" style={{ padding: '2px' }} onClick={(e) => { e.stopPropagation(); setHistoryDevice(device); }}>
+                          <History size={14} />
+                        </button>
                         <button className="icon-btn" style={{ padding: '2px' }} onClick={(e) => openSettings(device, e)}>
                           <Settings size={14} />
                         </button>
@@ -772,6 +798,35 @@ function App() {
             <div className="modal-actions" style={{borderTop: '1px solid var(--border)', paddingTop: '16px'}}>
               <button onClick={() => setShowDistributionModal(false)}>Cancel</button>
               <button className="primary-btn" onClick={executeDistribution}>Execute Distribution</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {historyDevice && (
+        <div className="modal-overlay" onClick={() => setHistoryDevice(null)}>
+          <div className="modal-content" onClick={e => e.stopPropagation()} style={{ width: '500px', maxWidth: '90vw' }}>
+            <h3>Action History: {historyDevice.customName || historyDevice.name || historyDevice.id}</h3>
+            <div style={{ maxHeight: '400px', overflowY: 'auto', background: 'var(--bg-color)', padding: '12px', borderRadius: '8px' }}>
+              {historyDevice.history && historyDevice.history.length > 0 ? (
+                historyDevice.history.map((h, i) => (
+                  <div key={i} style={{ marginBottom: '8px', paddingBottom: '8px', borderBottom: '1px solid var(--border)', display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+                    <span style={{ color: 'var(--text-muted)', fontSize: '12px', whiteSpace: 'nowrap' }}>
+                      {new Date(h.timestamp).toLocaleString()}
+                    </span>
+                    <span style={{ fontSize: '14px', color: 'var(--text-main)', wordBreak: 'break-word' }}>
+                      {h.action}
+                    </span>
+                  </div>
+                ))
+              ) : (
+                <div style={{ color: 'var(--text-muted)', textAlign: 'center', padding: '20px' }}>
+                  No action history available for this device.
+                </div>
+              )}
+            </div>
+            <div className="modal-actions" style={{ marginTop: '16px' }}>
+              <button className="primary-btn" onClick={() => setHistoryDevice(null)}>Close</button>
             </div>
           </div>
         </div>

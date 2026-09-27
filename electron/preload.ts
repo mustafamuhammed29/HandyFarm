@@ -24,5 +24,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   launchApp: (deviceId: string, packageName: string) => ipcRenderer.invoke('launch-app', deviceId, packageName),
   clearAppCache: (deviceId: string, packageName: string) => ipcRenderer.invoke('clear-app-cache', deviceId, packageName),
   runAdbCommand: (deviceId: string, command: string) => ipcRenderer.invoke('run-adb-command', deviceId, command),
-  openSettings: (deviceId: string, intent: string) => ipcRenderer.invoke('open-settings', deviceId, intent)
+  openSettings: (deviceId: string, intent: string) => ipcRenderer.invoke('open-settings', deviceId, intent),
+  saveTestAccountPassword: (accountId: string, password: string) => ipcRenderer.invoke('save-test-account-password', accountId, password),
+  getTestAccountPassword: (accountId: string) => ipcRenderer.invoke('get-test-account-password', accountId)
 });

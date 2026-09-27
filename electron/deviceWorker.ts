@@ -17,7 +17,7 @@ async function updateDeviceData() {
   }
 
   try {
-    const properties = await client.getProperties(deviceId);
+    const properties = await client.getDevice(deviceId).getProperties();
     
     // Attempt to extract useful info
     const model = properties['ro.product.model'];
@@ -64,7 +64,7 @@ let screenshotInterval: NodeJS.Timeout | null = null;
 async function takeScreenshot() {
   if (status !== 'device') return;
   try {
-    const stream = await client.screencap(deviceId);
+    const stream = await client.getDevice(deviceId).screencap();
     const chunks: Buffer[] = [];
     stream.on('data', (chunk) => chunks.push(chunk));
     stream.on('end', () => {
@@ -83,23 +83,40 @@ async function takeScreenshot() {
 updateDeviceData();
 setTimeout(takeScreenshot, 2000);
 
+let currentIntervalMs = parseInt(process.argv[4] || '10000', 10);
+
 // Listen for status changes from main process
 process.on('message', (msg: any) => {
   if (msg.type === 'STATUS_CHANGE') {
     status = msg.status;
     updateDeviceData();
     if (status === 'device' && !screenshotInterval) {
-        screenshotInterval = setInterval(takeScreenshot, 10000); // 10 seconds
+        screenshotInterval = setInterval(takeScreenshot, currentIntervalMs);
     } else if (status !== 'device' && screenshotInterval) {
         clearInterval(screenshotInterval);
         screenshotInterval = null;
+    }
+  } else if (msg.type === 'UPDATE_SCREENCAP_INTERVAL') {
+    currentIntervalMs = msg.interval;
+    if (screenshotInterval) {
+      clearInterval(screenshotInterval);
+      screenshotInterval = setInterval(takeScreenshot, currentIntervalMs);
+    }
+  } else if (msg.type === 'PAUSE_SCREENCAP') {
+    if (screenshotInterval) {
+      clearInterval(screenshotInterval);
+      screenshotInterval = null;
+    }
+  } else if (msg.type === 'RESUME_SCREENCAP') {
+    if (status === 'device' && !screenshotInterval) {
+      screenshotInterval = setInterval(takeScreenshot, currentIntervalMs);
     }
   }
 });
 
 // Setup interval for screenshots if already connected
 if (status === 'device') {
-    screenshotInterval = setInterval(takeScreenshot, 10000);
+    screenshotInterval = setInterval(takeScreenshot, currentIntervalMs);
 }
 
 // Keep worker alive
