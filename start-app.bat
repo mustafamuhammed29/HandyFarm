@@ -1,0 +1,3 @@
+@echo off
+echo Starting Shop Device Control Panel...
+call npm run dev

@@ -1,0 +1,22 @@
+# Shop Device Control Panel
+
+## Prerequisites
+1. **Node.js** must be installed on this computer.
+2. **scrcpy** must be installed and added to the Windows PATH (so that running `scrcpy` in the command prompt works from anywhere).
+
+## How to Start the App
+
+### Option A: Quick Launch (Development / Unpackaged Mode)
+Use this if you just want to run the app right away without packaging it.
+1. Double-click the `start-app.bat` file located in this folder.
+2. A command prompt window will open and launch the app. Keep that window open while using the app.
+
+### Option B: Final Packaged Version (For Daily Shop Use)
+Use this to create a standalone executable (`.exe`) that doesn't require a terminal or Node.js to be running in the background. This is the recommended approach for daily shop staff use.
+
+1. Double-click the `package-app.bat` file in this folder. 
+2. Wait a minute or two while it builds the application.
+3. Once complete, navigate to the newly created `release` folder in this directory.
+4. You will find **Shop Device Control Panel Setup.exe**. 
+5. Run that setup file to install the app on the computer like a normal Windows program. 
+6. (Optional) You can now create a shortcut on your Desktop to the installed application, and shop staff will never have to touch a terminal again!
