@@ -113,7 +113,7 @@ async function takeScreenshot() {
   try {
     const stream = await client.getDevice(deviceId).screencap();
     const chunks: Buffer[] = [];
-    stream.on('data', (chunk) => chunks.push(chunk));
+    stream.on('data', (chunk: Buffer) => chunks.push(chunk));
     stream.on('end', () => {
       const buffer = Buffer.concat(chunks);
       process.send?.({

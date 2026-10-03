@@ -38,6 +38,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startLogcat: (deviceId: string) => ipcRenderer.invoke('start-logcat', deviceId),
   stopLogcat: (deviceId: string) => ipcRenderer.invoke('stop-logcat', deviceId),
   onLogcatData: (deviceId: string, callback: (data: string) => void) => {
+    ipcRenderer.removeAllListeners(`logcat-data-${deviceId}`);
     ipcRenderer.on(`logcat-data-${deviceId}`, (_event, data) => callback(data));
   },
   offLogcatData: (deviceId: string) => {

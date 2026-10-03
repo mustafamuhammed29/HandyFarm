@@ -2,7 +2,7 @@ console.log('BUILD CANARY:', Date.now(), 'ALPHA-BRAVO-123');
 import { app, BrowserWindow, ipcMain, safeStorage, dialog, clipboard } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { fork, ChildProcess, exec } from 'child_process';
+import { fork, ChildProcess, exec, spawn } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
@@ -19,10 +19,22 @@ const __dirname = path.dirname(__filename);
 console.log('__dirname is:', __dirname);
 console.log('preload path is:', path.join(__dirname, 'preload.js'));
 
+export function getResourcePath(fileName: string): string {
+  const baseDir = app.isPackaged ? app.getAppPath() : __dirname;
+  const p1 = path.join(baseDir, 'resources', fileName);
+  if (fs.existsSync(p1)) return p1;
+  const p2 = path.join(__dirname, '..', 'resources', fileName);
+  if (fs.existsSync(p2)) return p2;
+  const p3 = path.join(app.getAppPath(), 'resources', fileName);
+  if (fs.existsSync(p3)) return p3;
+  return p1;
+}
+
 const client = Adb.createClient();
 
 let mainWindow: BrowserWindow | null = null;
 const workers: Map<string, ChildProcess> = new Map();
+const workerGenerations: Map<string, number> = new Map();
 
 const dbPath = path.join(app.getPath('userData'), 'devices.json');
 let localDb: Record<string, any> = {};
@@ -114,7 +126,7 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
 
-  mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
+  mainWindow.webContents.on('console-message', (_event, _level, message, line, sourceId) => {
     console.log(`[Renderer Console] ${message} (${sourceId}:${line})`);
   });
 }
@@ -297,6 +309,9 @@ function queueWorker(deviceId: string, status: string) {
 function spawnWorker(deviceId: string, status: string) {
   if (workers.has(deviceId)) return;
 
+  const currentGen = (workerGenerations.get(deviceId) || 0) + 1;
+  workerGenerations.set(deviceId, currentGen);
+
   // Compute the interval it will have once added
   const initialInterval = getComputedInterval(workers.size + 1);
   
@@ -305,6 +320,10 @@ function spawnWorker(deviceId: string, status: string) {
   const worker = fork(workerPath, [deviceId, status, initialInterval.toString()]);
 
   worker.on('message', (msg: any) => {
+    if (workerGenerations.get(deviceId) !== currentGen || workers.get(deviceId) !== worker) {
+      return;
+    }
+
     if (msg.type === 'DEVICE_DATA') {
       localDb[deviceId] = { ...localDb[deviceId], ...msg.data, id: deviceId };
       if (!localDb[deviceId].serial) {
@@ -344,6 +363,7 @@ function spawnWorker(deviceId: string, status: string) {
               console.log(`[Dedupe] MATCH! Evicting stale/duplicate device ${idToKill} to enforce one tile per physical device`);
               const oldWorker = workers.get(idToKill);
               if (oldWorker) {
+                workerGenerations.set(idToKill, (workerGenerations.get(idToKill) || 0) + 1);
                 oldWorker.kill();
                 workers.delete(idToKill);
               }
@@ -367,7 +387,14 @@ function spawnWorker(deviceId: string, status: string) {
   });
 
   worker.on('exit', (code) => {
-    console.log(`Worker for ${deviceId} exited with code ${code}`);
+    console.log(`Worker for ${deviceId} (gen ${currentGen}) exited with code ${code}`);
+    
+    // Ignore stale exit handlers if generation moved on or worker replaced
+    if (workerGenerations.get(deviceId) !== currentGen || workers.get(deviceId) !== worker) {
+      console.log(`[Worker Exit] Ignoring stale exit event for ${deviceId} (gen ${currentGen} vs current ${workerGenerations.get(deviceId)})`);
+      return;
+    }
+
     workers.delete(deviceId);
     checkQueue();
     broadcastScreencapInterval();
@@ -396,6 +423,9 @@ ipcMain.handle('get-devices', () => {
 
 ipcMain.handle('retry-device', (_event, deviceId: string) => {
   console.log(`[Retry] Requested for device ${deviceId}`);
+
+  // Invalidate any in-flight exit handlers from the existing worker
+  workerGenerations.set(deviceId, (workerGenerations.get(deviceId) || 0) + 1);
 
   // Kill any existing zombie worker
   const existingWorker = workers.get(deviceId);
@@ -434,7 +464,7 @@ ipcMain.handle('retry-device', (_event, deviceId: string) => {
 });
 
 
-const activeLiveViews = new Map<string, { ws: WebSocketServer, client: AdbScrcpyClient, adb: YumeAdb }>();
+const activeLiveViews = new Map<string, { ws: WebSocketServer, client: AdbScrcpyClient<any>, adb: YumeAdb }>();
 
 
 function closeLiveView(deviceId: string, reason: string) {
@@ -500,16 +530,16 @@ ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, vi
   const transport = await client.createTransport({ serial: deviceId });
   const yumeAdb = new YumeAdb(transport);
 
-  const serverBuffer = fs.readFileSync(path.join(process.cwd(), 'scrcpy-server-v2.4.jar'));
+  const serverBuffer = fs.readFileSync(getResourcePath('scrcpy-server-v2.4.jar'));
   
   await AdbScrcpyClient.pushServer(
     yumeAdb,
-    new ReadableStream({
+    new ReadableStream<any>({
       start(controller) {
         controller.enqueue(new Uint8Array(serverBuffer));
         controller.close();
       }
-    }),
+    }) as any,
     '/data/local/tmp/scrcpy-server.jar'
   );
 
@@ -531,7 +561,7 @@ ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, vi
 
   const scrcpyOptions = new AdbScrcpyOptions2_4(initOptions, { version: '2.4' });
 
-  let activeScrcpyClient;
+  let activeScrcpyClient: AdbScrcpyClient<any> | undefined;
   try {
     activeScrcpyClient = await AdbScrcpyClient.start(
       yumeAdb,
@@ -570,7 +600,7 @@ ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, vi
 
   const activeLiveViewWs = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   
-  activeLiveViews.set(deviceId, { ws: activeLiveViewWs, client: activeScrcpyClient, adb: yumeAdb });
+  activeLiveViews.set(deviceId, { ws: activeLiveViewWs, client: activeScrcpyClient!, adb: yumeAdb });
 
   await new Promise<void>((resolve) => activeLiveViewWs.on('listening', resolve));
   const port = (activeLiveViewWs.address() as any).port;
@@ -593,12 +623,12 @@ ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, vi
               if (value.type === 'configuration') {
                 header[0] |= 1;
               }
-              if (value.keyframe) {
+              if ((value as any).keyframe) {
                 header[0] |= 2;
               }
               
               if (packetCount < 10) {
-                console.log(`[POC-SND] Pkt ${packetCount} | type: ${value.type} | keyframe: ${value.keyframe} | header byte: ${header[0]} | size: ${value.data.byteLength}`);
+                console.log(`[POC-SND] Pkt ${packetCount} | type: ${value.type} | keyframe: ${(value as any).keyframe} | header byte: ${header[0]} | size: ${value.data.byteLength}`);
                 packetCount++;
               }
               
@@ -614,7 +644,7 @@ ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, vi
     };
     pumpVideo();
 
-    const messageHandler = async (data: any, isBinary: boolean) => {
+    const messageHandler = async (data: any, _isBinary: boolean) => {
       console.log('RAW WS MESSAGE:', typeof data, data);
       if (!activeScrcpyClient!.controller) {
         console.log('[POC-TOUCH] activeScrcpyClient.controller is falsy! Bailing out.');
@@ -709,7 +739,7 @@ ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, vi
             console.error('[POC] Failed to send RESUME_SCREENCAP to worker:', err);
           }
         }
-        activeScrcpyClient.close();
+        activeScrcpyClient?.close();
         yumeAdb.close();
         activeLiveViews.delete(deviceId);
 
@@ -902,8 +932,25 @@ ipcMain.handle('take-screenshot', async (_event, deviceId) => {
   }
 });
 
+async function ensureClipperInstalled(deviceId: string) {
+  const clipperPath = getResourcePath('clipper.apk');
+  if (!fs.existsSync(clipperPath)) return;
+  try {
+    const stream = await client.getDevice(deviceId).shell('pm path ca.zgrs.clipper');
+    const out = (await Adb.util.readAll(stream)).toString();
+    if (!out.includes('package:')) {
+      console.log(`[Clipper] Installing clipper.apk on ${deviceId} from ${clipperPath}...`);
+      await client.getDevice(deviceId).install(clipperPath);
+      await client.getDevice(deviceId).shell('am startservice ca.zgrs.clipper/.ClipboardService');
+    }
+  } catch (err: any) {
+    console.warn(`[Clipper] Auto-install check failed for ${deviceId}:`, err?.message || err);
+  }
+}
+
 ipcMain.handle('sync-clipboard', async (_event, deviceId, direction, text) => {
   try {
+    await ensureClipperInstalled(deviceId);
     if (direction === 'toDevice') {
       const sanitized = sanitizeFreeText(text || '');
       await client.getDevice(deviceId).shell(`am broadcast -a clipper.set -e text "${sanitized}"`);
@@ -963,6 +1010,7 @@ ipcMain.handle('switch-to-wireless', async (_event, deviceId) => {
     const oldId = deviceId;
     const oldWorker = workers.get(oldId);
     if (oldWorker) {
+      workerGenerations.set(oldId, (workerGenerations.get(oldId) || 0) + 1);
       oldWorker.kill();
       workers.delete(oldId);
     }
@@ -1015,7 +1063,7 @@ ipcMain.handle('pull-file', async (_event, deviceId, remotePath, localPath) => {
         logAction(deviceId, `Pulled file to ${localPath}`);
         resolve({ success: true });
       });
-      transfer.on('error', (err) => resolve({ success: false, error: err.message }));
+      transfer.on('error', (err: any) => resolve({ success: false, error: err.message }));
       transfer.pipe(writeStream);
     });
   } catch (e: any) {
@@ -1101,17 +1149,17 @@ ipcMain.handle('locate-device', async (_event, deviceId) => {
   }
 });
 
-const activeLogcats = new Map<string, ReturnType<typeof spawn>>();
+const activeLogcats = new Map<string, ChildProcess>();
 ipcMain.handle('start-logcat', async (event, deviceId) => {
   try {
     if (activeLogcats.has(deviceId)) {
       activeLogcats.get(deviceId)?.kill();
     }
     const proc = spawn('adb', ['-s', deviceId, 'logcat', '-v', 'time']);
-    proc.stdout.on('data', (data) => {
+    proc.stdout?.on('data', (data: any) => {
        event.sender.send(`logcat-data-${deviceId}`, data.toString());
     });
-    proc.stderr.on('data', (data) => {
+    proc.stderr?.on('data', (data: any) => {
        event.sender.send(`logcat-data-${deviceId}`, data.toString());
     });
     activeLogcats.set(deviceId, proc);
@@ -1253,9 +1301,9 @@ ipcMain.handle('get-installed-packages', async (_event, deviceId: string) => {
     const output = await Adb.util.readAll(stream);
     const text = output.toString();
     const packages = text.split('\n')
-      .map(l => l.trim())
-      .filter(l => l.startsWith('package:'))
-      .map(l => l.replace('package:', ''));
+      .map((l: string) => l.trim())
+      .filter((l: string) => l.startsWith('package:'))
+      .map((l: string) => l.replace('package:', ''));
     return { success: true, packages };
   } catch (e: any) {
     return { success: false, error: e.message };

@@ -44,7 +44,7 @@
     "appId": "com.shop.devicecontrol",
     "productName": "Shop Device Control Panel",
     "directories": {
-      "output": "release"
+      "output": "dist-release"
     },
     "win": {
       "target": [
@@ -54,7 +54,8 @@
     },
     "files": [
       "dist/**/*",
-      "dist-electron/**/*"
+      "dist-electron/**/*",
+      "resources/**/*"
     ]
   }
 }
