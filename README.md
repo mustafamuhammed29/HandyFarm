@@ -20,3 +20,10 @@ Use this to create a standalone executable (`.exe`) that doesn't require a termi
 4. You will find **Shop Device Control Panel Setup.exe**. 
 5. Run that setup file to install the app on the computer like a normal Windows program. 
 6. (Optional) You can now create a shortcut on your Desktop to the installed application, and shop staff will never have to touch a terminal again!
+
+## Architecture Note: Embedded Live View Grid
+This application natively embeds the Android screen mirroring functionality directly inside the UI, without launching external window processes.
+- **Protocol & Decoding**: It uses the `@yume-chan/scrcpy` ecosystem and `@yume-chan/scrcpy-decoder-webcodecs` to deserialize and decode the H.264 video stream into a `<canvas>` element using hardware acceleration.
+- **WebSocket Bridge**: The Electron main process spins up an ephemeral WebSocket server strictly bound to `127.0.0.1` to proxy raw video payloads and JSON touch commands safely.
+- **Concurrency**: To prevent USB bandwidth starvation, a hard limit of `4` concurrent streams is enforced. Attempting to open more than 4 screens simultaneously will be blocked until another screen is closed.
+- **Input Injection**: The `<canvas>` elements forward accurate boundary-mapped `PointerEvents` to the device as multi-touch Android `AMOTION_EVENT` inputs, creating a seamless remote control experience entirely within HandyFarm.

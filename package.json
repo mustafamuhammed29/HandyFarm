@@ -12,10 +12,17 @@
   },
   "dependencies": {
     "@devicefarmer/adbkit": "^3.3.9",
+    "@types/ws": "^8.18.1",
+    "@yume-chan/adb": "^2.6.4",
+    "@yume-chan/adb-scrcpy": "^2.3.2",
+    "@yume-chan/adb-server-node-tcp": "^2.5.2",
+    "@yume-chan/scrcpy": "^2.3.0",
+    "@yume-chan/scrcpy-decoder-webcodecs": "^2.5.3",
     "lucide-react": "^1.48.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "stf-device-db": "^1.2.0"
+    "stf-device-db": "^1.2.0",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",

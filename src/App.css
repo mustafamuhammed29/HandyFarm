@@ -557,3 +557,8 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
 }
+.thumb-actions.hover-only { opacity: 0; transition: opacity 0.2s; }
+.thumb-card:hover .thumb-actions.hover-only { opacity: 1; }
+. t h u m b - a c t i o n s . h o v e r - o n l y   {   o p a c i t y :   0 ;   t r a n s i t i o n :   o p a c i t y   0 . 2 s ;   }  
+ . t h u m b - c a r d : h o v e r   . t h u m b - a c t i o n s . h o v e r - o n l y   {   o p a c i t y :   1 ;   }  
+ 

@@ -1,11 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { 
-  Smartphone, XCircle, Play, CheckSquare, Square, RefreshCw, Link as LinkIcon, Download, RotateCcw, 
-  Moon, Sun, Pin, PinOff, Settings, Search, LayoutGrid, Monitor, 
-  Tag, Terminal, Camera, Power, FileUp, FileDown, Save, Key, History
+  Smartphone, XCircle, Play, CheckSquare, Square, RefreshCw, Link as LinkIcon, Download, 
+  Moon, Sun, Pin, PinOff, Settings, Search, 
+  Terminal, Power, FileUp, FileDown, Save, Key, History, Copy, Wifi
 } from 'lucide-react';
 import './App.css';
 import type { DeviceData, QuickPhrase, TestAccount } from './types';
+import { LiveViewPoc } from './components/LiveViewPoc';
+import type { LiveViewPocRef } from './components/LiveViewPoc';
 
 function App() {
   const [devices, setDevices] = useState<DeviceData[]>([]);
@@ -14,11 +16,23 @@ function App() {
   const [results, setResults] = useState<{deviceId: string, success: boolean, error?: string, action: string}[] | null>(null);
   
   const [focusedDeviceId, setFocusedDeviceId] = useState<string | null>(null);
-  const [isRotated, setIsRotated] = useState(false);
   const [sidebarPinned, setSidebarPinned] = useState(true);
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [searchQuery, setSearchQuery] = useState('');
-  
+  const [isMirrorMode, setIsMirrorMode] = useState(false);
+  const liveViewRefs = useRef<{ [key: string]: LiveViewPocRef | null }>({});
+  const [gridDensity, setGridDensity] = useState<'compact' | 'normal' | 'large'>(
+    (localStorage.getItem('gridDensity') as any) || 'large'
+  );
+  const [zoomLevel, setZoomLevel] = useState<number>(
+    parseFloat(localStorage.getItem('gridZoom') || '1')
+  );
+
+  useEffect(() => {
+    localStorage.setItem('gridDensity', gridDensity);
+    localStorage.setItem('gridZoom', zoomLevel.toString());
+  }, [gridDensity, zoomLevel]);
+
   // Phase 7 state
   const [activeTagFilter, setActiveTagFilter] = useState('');
   const [allTags, setAllTags] = useState<string[]>([]);
@@ -39,6 +53,13 @@ function App() {
   
   const [singleTargetId, setSingleTargetId] = useState('');
   const [singleTargetText, setSingleTargetText] = useState('');
+  
+  const [apkPath, setApkPath] = useState('');
+  const [url, setUrl] = useState('');
+  const [globalMessage, setGlobalMessage] = useState('');
+  const [confirmDialog, setConfirmDialog] = useState<{msg: string, onConfirm: () => void} | null>(null);
+  
+  const [discoveredDevices, setDiscoveredDevices] = useState<{name: string, ip: string, serial?: string}[]>([]);
 
   // Settings Modal
   const [settingsDevice, setSettingsDevice] = useState<DeviceData | null>(null);
@@ -60,7 +81,7 @@ function App() {
         if (acc.password) {
           const res = await window.electronAPI.saveTestAccountPassword(acc.id, acc.password);
           if (!res.success) {
-            alert(`Migration failed for account ${acc.id}: ${res.error}`);
+            setGlobalMessage(`Migration failed for account ${acc.id}: ${res.error}`);
             // Do not delete password if migration failed
           } else {
             delete acc.password;
@@ -92,6 +113,17 @@ function App() {
   }, [theme]);
 
   useEffect(() => {
+    let interval: any;
+    const fetchMdns = async () => {
+      const result = await window.electronAPI.scanMdns();
+      if (result) setDiscoveredDevices(result);
+    };
+    fetchMdns();
+    interval = setInterval(fetchMdns, 15000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
     window.electronAPI.getDevices().then(setDevices);
     window.electronAPI.onDevicesUpdated((updatedDevices) => {
       setDevices(updatedDevices);
@@ -106,7 +138,15 @@ function App() {
   const toggleSidebar = () => setSidebarPinned(p => !p);
 
   const getFilteredDevices = () => {
-    let filtered = devices;
+    // Hide fully offline devices, and devices that haven't been resolved yet (no serial or undefined status)
+    let filtered = devices.filter(d => 
+      d.status !== 'offline' && 
+      d.status !== 'disconnect' && 
+      d.status !== undefined && 
+      d.status !== 'undefined' &&
+      d.serial // Only show devices that have successfully fetched their properties
+    );
+    
     if (activeTagFilter) {
       filtered = filtered.filter(d => d.tags?.includes(activeTagFilter));
     }
@@ -123,7 +163,52 @@ function App() {
     return filtered;
   };
 
-  const visibleDevices = getFilteredDevices();
+  const visibleDevices = getFilteredDevices().sort((a, b) => {
+    const tA = a.connectedAt || 0;
+    const tB = b.connectedAt || 0;
+    return tA - tB;
+  });
+  const activeDeviceCount = new Set(devices.filter(d => d.status === 'device').map(d => d.serial || d.id)).size;
+  let currentMaxSize = 800;
+  let currentVideoBitRate = 2000000;
+  if (activeDeviceCount >= 11) {
+    currentMaxSize = 320;
+    currentVideoBitRate = 500000;
+  } else if (activeDeviceCount >= 5) {
+    currentMaxSize = 480;
+    currentVideoBitRate = 1000000;
+  }
+
+  const handleMirrorTouch = useCallback((sourceId: string, action: number, px: number, py: number) => {
+    if (isMirrorMode && selectedIds.has(sourceId)) {
+      selectedIds.forEach(id => {
+        if (id !== sourceId && liveViewRefs.current[id]) {
+          liveViewRefs.current[id]!.simulateTouch(action, px, py);
+        }
+      });
+    }
+  }, [isMirrorMode, selectedIds]);
+
+  const handleMirrorKeyCode = useCallback((sourceId: string, keycode: number) => {
+    if (isMirrorMode && selectedIds.has(sourceId)) {
+      selectedIds.forEach(id => {
+        if (id !== sourceId && liveViewRefs.current[id]) {
+          liveViewRefs.current[id]!.sendKeyCode(keycode);
+        }
+      });
+    }
+  }, [isMirrorMode, selectedIds]);
+
+  const handleSwitchToWireless = async (deviceId: string) => {
+    setActionInProgress(true);
+    const res = await window.electronAPI.switchToWireless(deviceId);
+    setActionInProgress(false);
+    if (!res.success) {
+      alert(`Failed to switch to wireless: ${res.error}`);
+    } else {
+      alert(`Successfully switched device ${deviceId} to Wireless ADB at ${res.ip}:5555. You can now unplug the USB cable.`);
+    }
+  };
 
   const toggleSelectAll = () => {
     if (selectedIds.size === visibleDevices.length && visibleDevices.length > 0) {
@@ -142,10 +227,7 @@ function App() {
     setSelectedIds(newSet);
   };
 
-  const handleDeviceClick = (id: string) => {
-    setFocusedDeviceId(id);
-    setIsRotated(false);
-  };
+
 
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -161,7 +243,11 @@ function App() {
     }
 
     if (action === 'reboot' && !e?.altKey) {
-      if (!window.confirm(`Reboot ${targetIds.length} device(s)?`)) return;
+      setConfirmDialog({
+        msg: `Reboot ${targetIds.length} device(s)?`,
+        onConfirm: () => executeBulkAction(action, payload, { ...e, altKey: true } as any) // pass altKey to skip confirm next time
+      });
+      return;
     }
 
     setActionInProgress(true);
@@ -263,12 +349,12 @@ function App() {
 
   const handleExport = async () => {
     const res = await window.electronAPI.exportConfig();
-    if (res.success) alert(`Exported to ${res.path}`);
+    if (res.success) setGlobalMessage(`Exported to ${res.path}`);
   };
 
   const handleImport = async () => {
     const res = await window.electronAPI.importConfig();
-    if (res.success) alert(`Import successful!`);
+    if (res.success) setGlobalMessage(`Import successful!`);
   };
 
   const runAdbCommand = async () => {
@@ -277,8 +363,6 @@ function App() {
     const res = await window.electronAPI.runAdbCommand(focusedDeviceId, adbCommand);
     setAdbOutput(res.output || res.error || 'Done.');
   };
-
-  const focusedDevice = devices.find(d => d.id === focusedDeviceId);
 
   return (
     <div className={`app-container ${theme}`}>
@@ -321,12 +405,24 @@ function App() {
               <h3>Selection ({selectedIds.size})</h3>
               <span style={{fontSize:'11px', color:'var(--text-muted)'}}>Alt+Click = Focused Only</span>
             </div>
-            <button className="large-btn" onClick={toggleSelectAll}>
-              {selectedIds.size === visibleDevices.length && visibleDevices.length > 0 ? <CheckSquare size={20} className="text-accent" /> : <Square size={20} />}
-              {selectedIds.size === visibleDevices.length && visibleDevices.length > 0 ? 'Deselect All' : 'Select All'}
-            </button>
+            <div style={{display: 'flex', gap: '8px', marginTop: '8px'}}>
+              <button className="large-btn" style={{flex: 1}} onClick={toggleSelectAll}>
+                {selectedIds.size === visibleDevices.length && visibleDevices.length > 0 ? <CheckSquare size={20} className="text-accent" /> : <Square size={20} />}
+                {selectedIds.size === visibleDevices.length && visibleDevices.length > 0 ? 'Deselect All' : 'Select All'}
+              </button>
+              
+
+              <button 
+                className={`large-btn ${isMirrorMode ? 'primary' : ''}`}  
+                style={{flex: 1}} 
+                onClick={() => setIsMirrorMode(!isMirrorMode)}
+              >
+                <Copy size={20} />
+                Mirror Input {isMirrorMode ? 'ON' : 'OFF'}
+              </button>
+            </div>
             
-            <div style={{display: 'flex', gap: '8px'}}>
+            <div style={{display: 'flex', gap: '8px', marginTop: '8px'}}>
               <button className="large-btn" style={{flex: 1, padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={handleImport} title="Import Config"><FileDown size={16}/> Import</button>
               <button className="large-btn" style={{flex: 1, padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={handleExport} title="Export Config"><FileUp size={16}/> Export</button>
             </div>
@@ -334,12 +430,18 @@ function App() {
 
           <div className="action-section">
             <h3>Batch App & Files</h3>
-            <button className="large-btn" disabled={actionInProgress} onClick={(e) => executeBulkAction('installApk', window.prompt('APK Path:'), e)}>
-              <Download size={20} /> Install APK
-            </button>
-            <button className="large-btn" disabled={actionInProgress} onClick={(e) => executeBulkAction('openLink', window.prompt('URL:'), e)}>
-              <LinkIcon size={20} /> Open Link
-            </button>
+            <div style={{display: 'flex', gap: '8px', background: 'var(--bg-color)', padding: '8px', borderRadius: '8px'}}>
+              <input type="text" placeholder="APK Path" value={apkPath} onChange={e => setApkPath(e.target.value)} style={{flex: 1, padding: '8px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)'}} />
+              <button className="icon-btn active" disabled={actionInProgress || !apkPath} onClick={(e) => executeBulkAction('installApk', apkPath, e)} title="Install APK">
+                <Download size={18} />
+              </button>
+            </div>
+            <div style={{display: 'flex', gap: '8px', background: 'var(--bg-color)', padding: '8px', borderRadius: '8px', marginTop: '8px'}}>
+              <input type="text" placeholder="URL" value={url} onChange={e => setUrl(e.target.value)} style={{flex: 1, padding: '8px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)'}} />
+              <button className="icon-btn active" disabled={actionInProgress || !url} onClick={(e) => executeBulkAction('openLink', url, e)} title="Open Link">
+                <LinkIcon size={18} />
+              </button>
+            </div>
             <div style={{display: 'flex', gap: '8px', background: 'var(--bg-color)', padding: '8px', borderRadius: '8px'}}>
               <input type="text" placeholder="Package name" value={appPackageName} onChange={e => setAppPackageName(e.target.value)} style={{flex: 1, padding: '8px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)'}} />
               <button className="icon-btn active" onClick={(e) => executeBulkAction('launchApp', appPackageName, e)} title="Launch App"><Play size={18}/></button>
@@ -380,7 +482,7 @@ function App() {
                     const file = e.target.files?.[0];
                     if (!file) return;
                     if (selectedIds.size === 0) {
-                      alert("Please select target devices first.");
+                      setGlobalMessage("Please select target devices first.");
                       return;
                     }
                     const reader = new FileReader();
@@ -450,140 +552,206 @@ function App() {
       </aside>
 
       <main className="main-content">
-        <div className="focused-view">
-          {focusedDevice ? (
-            <div className="focused-card">
-              <div className="focused-header">
-                <div className="focused-title-area">
-                  <h2 className="focused-title">
-                    {focusedDevice.customName || focusedDevice.name || focusedDevice.model || 'Unknown Device'}
-                    {focusedDevice.isBareBoard && <span className="board-badge">Bare Board</span>}
-                  </h2>
-                  <div style={{ fontSize: '14px', color: 'var(--text-muted)' }}>
-                    ({focusedDevice.serial || focusedDevice.id})
-                  </div>
-                </div>
-                <div className="focused-actions">
-                  <button className="icon-btn" onClick={() => window.electronAPI.takeScreenshot(focusedDevice.id)} title="Save Screenshot">
-                    <Camera size={20} />
-                  </button>
-                  <button className="icon-btn" onClick={() => window.electronAPI.toggleScreen(focusedDevice.id)} title="Toggle Screen Power">
-                    <Power size={20} />
-                  </button>
-                  <button className="icon-btn" onClick={() => setIsRotated(!isRotated)} title="Rotate Screen">
-                    <RotateCcw size={20} />
-                  </button>
-                  <button className="large-btn primary" style={{ padding: '8px 16px', fontSize: '14px' }} disabled={focusedDevice.status !== 'device'} onClick={() => window.electronAPI.launchScrcpy(focusedDevice.id, {maxFps: 60})}>
-                    <Play size={18} /> Full Control
-                  </button>
-                  <button className="icon-btn" onClick={() => setShowAdbConsole(!showAdbConsole)} title="ADB Console">
-                    <Terminal size={20} />
-                  </button>
-                </div>
-              </div>
-              <div className="focused-body">
-                {focusedDevice.thumbnail && !focusedDevice.isBareBoard ? (
-                  <img 
-                    src={focusedDevice.thumbnail} 
-                    alt="Screen" 
-                    className={`focused-image ${isRotated ? 'rotated' : ''}`} 
-                  />
-                ) : (
-                  <div className="no-focus-state">
-                    <Monitor size={64} opacity={0.2} />
-                    <span>No screen feed available</span>
-                  </div>
-                )}
-              </div>
-              {showAdbConsole && (
-                <div style={{borderTop: '1px solid var(--border)', padding: '16px', background: 'var(--bg-color)', display: 'flex', flexDirection: 'column', gap: '8px'}}>
-                  <div style={{display: 'flex', gap: '8px'}}>
-                    <span style={{fontFamily: 'monospace', color: 'var(--accent)', alignSelf: 'center'}}>$</span>
-                    <input 
-                      type="text" 
-                      value={adbCommand}
-                      onChange={e => setAdbCommand(e.target.value)}
-                      onKeyDown={e => e.key === 'Enter' && runAdbCommand()}
-                      placeholder="adb shell command..."
-                      style={{flex: 1, padding: '8px', background: 'var(--card-bg)', color: 'var(--text-main)', border: '1px solid var(--border)', borderRadius: '4px', fontFamily: 'monospace'}}
-                    />
-                    <button className="large-btn primary" style={{padding: '8px 16px', fontSize: '14px'}} onClick={runAdbCommand}>Run</button>
-                  </div>
-                  {adbOutput && (
-                    <pre style={{margin: 0, padding: '8px', background: '#000', color: '#0f0', borderRadius: '4px', fontSize: '12px', maxHeight: '100px', overflowY: 'auto'}}>
-                      {adbOutput}
-                    </pre>
-                  )}
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="no-focus-state">
-              <LayoutGrid size={64} opacity={0.2} />
-              <h2>No Device Focused</h2>
-              <p>Select a device from the thumbnail strip below.</p>
-            </div>
-          )}
-        </div>
-
-        <div className="thumbnail-strip-container">
-          <div className="strip-header">
-            <h2>Connected Devices</h2>
-            <div className="strip-stats">
-              <span><strong style={{color: 'var(--status-green)'}}>{devices.filter(d => d.status === 'device').length}</strong> Online</span>
+        <div className="strip-header" style={{ padding: '16px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            <h2 style={{ margin: 0 }}>Live Grid ({activeDeviceCount} Active, {currentMaxSize}p@{currentVideoBitRate/1000}Kbps)</h2>
+            <div className="strip-stats" style={{ marginTop: '4px' }}>
+              <span><strong style={{color: 'var(--status-green)'}}>{activeDeviceCount}</strong> Online</span>
               <span><strong style={{color: 'var(--status-red)'}}>{devices.filter(d => d.status === 'offline').length}</strong> Offline</span>
             </div>
           </div>
-          <div className="strip-scroll-area">
-            {visibleDevices.map(device => {
-              const isSelected = selectedIds.has(device.id);
-              const isFocused = focusedDeviceId === device.id;
-              
-              let statusColor = 'gray';
-              if (device.status === 'device') statusColor = 'green';
-              else if (device.status === 'offline') statusColor = 'red';
-              else if (device.status === 'unauthorized') statusColor = 'yellow';
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+            <div style={{ display: 'flex', border: '1px solid var(--border)', borderRadius: '4px', overflow: 'hidden' }}>
+              <button 
+                className={gridDensity === 'compact' ? 'primary-btn' : 'secondary-btn'} 
+                style={{ border: 'none', borderRadius: 0, padding: '4px 8px', fontSize: '12px' }}
+                onClick={() => setGridDensity('compact')}
+              >Compact</button>
+              <button 
+                className={gridDensity === 'normal' ? 'primary-btn' : 'secondary-btn'} 
+                style={{ border: 'none', borderRadius: 0, borderLeft: '1px solid var(--border)', padding: '4px 8px', fontSize: '12px' }}
+                onClick={() => setGridDensity('normal')}
+              >Normal</button>
+              <button 
+                className={gridDensity === 'large' ? 'primary-btn' : 'secondary-btn'} 
+                style={{ border: 'none', borderRadius: 0, borderLeft: '1px solid var(--border)', padding: '4px 8px', fontSize: '12px' }}
+                onClick={() => setGridDensity('large')}
+              >Large</button>
+            </div>
+            
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ fontSize: '14px', color: 'var(--text-muted)' }}>Tile Zoom:</span>
+              <input 
+                type="range" 
+                min="0.5" 
+                max="2.5" 
+                step="0.1" 
+                value={zoomLevel} 
+                onChange={e => setZoomLevel(parseFloat(e.target.value))} 
+                style={{ width: '100px' }}
+              />
+              <span style={{ fontSize: '14px', minWidth: '40px' }}>{Math.round(zoomLevel * 100)}%</span>
+            </div>
+          </div>
+        </div>
+        
+        <div className="focused-view" style={{ 
+          display: 'grid', 
+          gridTemplateColumns: `repeat(auto-fill, ${Math.floor((gridDensity === 'compact' ? 200 : gridDensity === 'normal' ? 280 : 380) * zoomLevel)}px)`, 
+          gap: '16px', 
+          padding: '16px', 
+          overflowY: 'auto', 
+          alignContent: 'start', 
+          justifyContent: 'start' 
+        }}>
+          {visibleDevices.map((device, index) => {
+            const isSelected = selectedIds.has(device.id);
+            const isDevice = device.status === 'device';
+            
+            let statusColor = 'gray';
+            if (isDevice) statusColor = 'green';
+            else if (device.status === 'offline') statusColor = 'red';
+            else if (device.status === 'unauthorized') statusColor = 'yellow';
 
-              return (
-                <div 
-                  key={device.id} 
-                  className={`thumb-card ${isSelected ? 'selected' : ''} ${isFocused ? 'is-focused' : ''}`}
-                  onClick={() => handleDeviceClick(device.id)}
-                >
-                  <div className="thumb-checkbox" onClick={(e) => toggleDeviceSelect(device.id, e)}>
-                    {isSelected ? <CheckSquare size={18} color="var(--accent)" /> : <Square size={18} color="white" />}
-                  </div>
-                  <div className="thumb-img">
-                    {device.thumbnail && !device.isBareBoard ? (
-                      <img src={device.thumbnail} alt="" />
-                    ) : (
-                      <Smartphone size={40} color="var(--text-muted)" opacity={0.5} />
-                    )}
-                  </div>
-                  <div className="thumb-footer">
-                    <div className="thumb-name">
-                      {device.customName || device.name || device.model || 'Unknown'}
+            const tileSizes = {
+              compact: { w: 200, h: 380 },
+              normal: { w: 280, h: 520 },
+              large: { w: 380, h: 700 }
+            };
+            const currentSize = tileSizes[gridDensity];
+
+            return (
+              <div 
+                key={device.id} 
+                className={`thumb-card ${isSelected ? 'selected' : ''}`} 
+                style={{ 
+                  width: `${Math.floor(currentSize.w * zoomLevel)}px`,
+                  height: `${Math.floor(currentSize.h * zoomLevel)}px`,
+                  display: 'flex', 
+                  flexDirection: 'column',
+                  background: 'var(--bg-dark)'
+                }}
+              >
+                <div style={{ position: 'absolute', top: 12, left: 12, zIndex: 20, cursor: 'pointer' }} onClick={(e) => toggleDeviceSelect(device.id, e)}>
+                  {isSelected ? <CheckSquare size={gridDensity === 'compact' ? 16 : 24} color="var(--accent)" /> : <Square size={gridDensity === 'compact' ? 16 : 24} color="white" />}
+                </div>
+
+                <div className="thumb-img" style={{ flex: 1, position: 'relative', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  {isDevice ? (
+                    <LiveViewPoc 
+                      deviceId={device.id} 
+                      maxSize={currentMaxSize}
+                      videoBitRate={currentVideoBitRate}
+                      startDelayMs={index * 1500}
+                      onMirrorTouch={(action, px, py) => handleMirrorTouch(device.id, action, px, py)}
+                      onMirrorKeyCode={(keycode) => handleMirrorKeyCode(device.id, keycode)}
+                      ref={el => { liveViewRefs.current[device.id] = el; }}
+                    />
+                  ) : (
+                    <div style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
+                      <Smartphone size={gridDensity === 'compact' ? 24 : 48} opacity={0.5} style={{ margin: '0 auto 8px' }} />
+                      {gridDensity !== 'compact' && <div style={{ fontWeight: 'bold', color: `var(--status-${statusColor})` }}>{device.status.toUpperCase()}</div>}
                     </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <div className="thumb-status">
-                        <div className={`status-dot ${statusColor}`} />
-                        {device.status}
+                  )}
+                </div>
+
+                {gridDensity !== 'compact' && (
+                  <div className="thumb-footer" style={{ padding: gridDensity === 'normal' ? '8px' : '12px' }}>
+                    {gridDensity === 'large' && (
+                      <div className="thumb-name" style={{ fontSize: '14px', marginBottom: '8px' }}>
+                        {device.customName || device.name || device.model || 'Unknown'} ({device.id})
                       </div>
-                      <div style={{display: 'flex', gap: '4px'}}>
-                        {device.tags && device.tags.length > 0 && <Tag size={12} color="var(--accent)" />}
-                        <button className="icon-btn" style={{ padding: '2px' }} onClick={(e) => { e.stopPropagation(); setHistoryDevice(device); }}>
+                    )}
+                    
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div className="thumb-status" style={{ fontSize: '12px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <div className={`status-dot ${statusColor}`} />
+                        {gridDensity === 'normal' ? (device.customName || device.id) : device.status}
+                      </div>
+                      
+                      <div className={`thumb-actions ${gridDensity === 'normal' ? 'hover-only' : ''}`} style={{ display: 'flex', gap: '4px' }}>
+                        {isDevice && (
+                          <>
+                            <button className="icon-btn" style={{ padding: '4px' }} onClick={() => window.electronAPI.toggleScreen(device.id)} title="Toggle Screen Power">
+                              <Power size={14} />
+                            </button>
+                            <button className="icon-btn" style={{ padding: '4px' }} onClick={() => handleSwitchToWireless(device.id)} title="Switch to Wireless ADB" disabled={actionInProgress}>
+                              <Wifi size={14} />
+                            </button>
+                            <button className="icon-btn" style={{ padding: '4px' }} onClick={() => { setFocusedDeviceId(device.id); setShowAdbConsole(true); }} title="ADB Console">
+                              <Terminal size={14} />
+                            </button>
+                          </>
+                        )}
+                        <button className="icon-btn" style={{ padding: '4px' }} onClick={() => setHistoryDevice(device)}>
                           <History size={14} />
                         </button>
-                        <button className="icon-btn" style={{ padding: '2px' }} onClick={(e) => openSettings(device, e)}>
+                        <button className="icon-btn" style={{ padding: '4px' }} onClick={(e) => openSettings(device, e)}>
                           <Settings size={14} />
                         </button>
                       </div>
                     </div>
                   </div>
+                )}
+              </div>
+            );
+          })}
+          {discoveredDevices.filter(dd => !devices.some(d => d.id === dd.ip || d.lastKnownIp === dd.ip.split(':')[0] || (dd.serial && (d.serial === dd.serial || d.id === dd.serial)))).map((dd, index) => {
+            const currentSize = {
+              compact: { w: 200, h: 380 },
+              normal: { w: 280, h: 520 },
+              large: { w: 380, h: 700 }
+            }[gridDensity];
+
+            return (
+              <div 
+                key={dd.ip} 
+                className={`thumb-card`} 
+                style={{ 
+                  width: `${Math.floor(currentSize.w * zoomLevel)}px`,
+                  height: `${Math.floor(currentSize.h * zoomLevel)}px`,
+                  display: 'flex', 
+                  flexDirection: 'column',
+                  background: 'var(--bg-dark)',
+                  border: '2px dashed var(--accent)',
+                  opacity: 0.8
+                }}
+              >
+                <div className="thumb-img" style={{ flex: 1, position: 'relative', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <div style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
+                    <Wifi size={gridDensity === 'compact' ? 24 : 48} opacity={0.5} style={{ margin: '0 auto 8px' }} color="var(--accent)" />
+                    {gridDensity !== 'compact' && <div style={{ fontWeight: 'bold', color: `var(--accent)` }}>DISCOVERED</div>}
+                  </div>
                 </div>
-              );
-            })}
-          </div>
+
+                {gridDensity !== 'compact' && (
+                  <div className="thumb-footer" style={{ padding: gridDensity === 'normal' ? '8px' : '12px' }}>
+                    {gridDensity === 'large' && (
+                      <div className="thumb-name" style={{ fontSize: '14px', marginBottom: '8px' }}>
+                        {dd.name || 'Unknown'} ({dd.ip})
+                      </div>
+                    )}
+                    
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div className="thumb-status" style={{ fontSize: '12px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <div className={`status-dot`} style={{ background: 'var(--accent)' }} />
+                        {gridDensity === 'normal' ? (dd.name || dd.ip) : 'New Network Device'}
+                      </div>
+                      
+                      <div className={`thumb-actions ${gridDensity === 'normal' ? 'hover-only' : ''}`} style={{ display: 'flex', gap: '4px' }}>
+                        <button className="icon-btn" style={{ padding: '4px', background: 'var(--accent)', color: 'black' }} onClick={async () => {
+                          const res = await window.electronAPI.connectIp(dd.ip);
+                          if (!res.success) setGlobalMessage(`Failed to connect to ${dd.ip}: ${res.error}`);
+                        }} title="Connect to device">
+                          Connect
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
 
         {results && (
@@ -610,6 +778,36 @@ function App() {
           </div>
         )}
       </main>
+
+      {showAdbConsole && focusedDeviceId && (
+        <div className="modal-overlay" onClick={() => setShowAdbConsole(false)}>
+          <div className="modal-content" onClick={e => e.stopPropagation()} style={{ width: '600px', maxWidth: '90vw' }}>
+            <h3>ADB Console: {focusedDeviceId}</h3>
+            <div style={{ padding: '16px', background: 'var(--bg-color)', display: 'flex', flexDirection: 'column', gap: '8px', borderRadius: '8px' }}>
+              <div style={{display: 'flex', gap: '8px'}}>
+                <span style={{fontFamily: 'monospace', color: 'var(--accent)', alignSelf: 'center'}}>$</span>
+                <input 
+                  type="text" 
+                  value={adbCommand}
+                  onChange={e => setAdbCommand(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && runAdbCommand()}
+                  placeholder="adb shell command..."
+                  style={{flex: 1, padding: '8px', background: 'var(--card-bg)', color: 'var(--text-main)', border: '1px solid var(--border)', borderRadius: '4px', fontFamily: 'monospace'}}
+                />
+                <button className="large-btn primary" style={{padding: '8px 16px', fontSize: '14px'}} onClick={runAdbCommand}>Run</button>
+              </div>
+              {adbOutput && (
+                <pre style={{margin: 0, padding: '8px', background: '#000', color: '#0f0', borderRadius: '4px', fontSize: '12px', maxHeight: '200px', overflowY: 'auto'}}>
+                  {adbOutput}
+                </pre>
+              )}
+            </div>
+            <div className="modal-actions" style={{ marginTop: '16px' }}>
+              <button className="primary-btn" onClick={() => setShowAdbConsole(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {settingsDevice && (
         <div className="modal-overlay" onClick={() => setSettingsDevice(null)}>
@@ -827,6 +1025,26 @@ function App() {
             </div>
             <div className="modal-actions" style={{ marginTop: '16px' }}>
               <button className="primary-btn" onClick={() => setHistoryDevice(null)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {globalMessage && (
+        <div style={{position: 'fixed', top: 20, right: 20, background: 'var(--card-bg)', border: '1px solid var(--border)', padding: '16px', borderRadius: '8px', zIndex: 9999, color: 'var(--text-main)', display: 'flex', flexDirection: 'column', gap: '8px', boxShadow: '0 4px 12px rgba(0,0,0,0.5)'}}>
+          <div>{globalMessage}</div>
+          <button className="primary-btn" onClick={() => setGlobalMessage('')}>OK</button>
+        </div>
+      )}
+
+      {confirmDialog && (
+        <div style={{position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000}}>
+          <div style={{background: 'var(--bg-color)', padding: '24px', borderRadius: '8px', border: '1px solid var(--border)', maxWidth: '400px'}}>
+            <h3 style={{marginTop: 0}}>Confirm Action</h3>
+            <p>{confirmDialog.msg}</p>
+            <div style={{display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '16px'}}>
+              <button className="secondary-btn" onClick={() => setConfirmDialog(null)}>Cancel</button>
+              <button className="primary-btn" onClick={() => { confirmDialog.onConfirm(); setConfirmDialog(null); }}>Confirm</button>
             </div>
           </div>
         </div>

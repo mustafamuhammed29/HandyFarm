@@ -11,6 +11,8 @@ export interface DeviceData {
   isBareBoard?: boolean;
   history?: { action: string, timestamp: string }[];
   tags?: string[];
+  connectedAt?: number;
+  lastKnownIp?: string;
 }
 
 export interface QuickPhrase {
@@ -36,7 +38,7 @@ declare global {
       installApk: (deviceId: string, apkPath: string) => Promise<{success: boolean, error?: string}>;
       updateDeviceData: (deviceId: string, data: Partial<DeviceData>) => Promise<boolean>;
       onDevicesUpdated: (callback: (devices: DeviceData[]) => void) => void;
-      
+      switchToWireless: (deviceId: string) => Promise<{success: boolean, ip?: string, error?: string}>;
       // Phase 7 Actions
       exportConfig: () => Promise<{success: boolean, path?: string, error?: string}>;
       importConfig: () => Promise<{success: boolean, error?: string}>;

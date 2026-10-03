@@ -2,7 +2,6 @@ import { contextBridge, ipcRenderer } from 'electron';
 
 contextBridge.exposeInMainWorld('electronAPI', {
   getDevices: () => ipcRenderer.invoke('get-devices'),
-  launchScrcpy: (deviceId: string, options?: any) => ipcRenderer.invoke('launch-scrcpy', deviceId, options),
   rebootDevice: (deviceId: string) => ipcRenderer.invoke('reboot-device', deviceId),
   openLink: (deviceId: string, url: string) => ipcRenderer.invoke('open-link', deviceId, url),
   installApk: (deviceId: string, apkPath: string) => ipcRenderer.invoke('install-apk', deviceId, apkPath),
@@ -11,6 +10,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.removeAllListeners('devices-updated');
     ipcRenderer.on('devices-updated', (_event, devices) => callback(devices));
   },
+  switchToWireless: (deviceId: string) => ipcRenderer.invoke('switch-to-wireless', deviceId),
   
   // Phase 7 Actions
   exportConfig: () => ipcRenderer.invoke('export-config'),
@@ -26,5 +26,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   runAdbCommand: (deviceId: string, command: string) => ipcRenderer.invoke('run-adb-command', deviceId, command),
   openSettings: (deviceId: string, intent: string) => ipcRenderer.invoke('open-settings', deviceId, intent),
   saveTestAccountPassword: (accountId: string, password: string) => ipcRenderer.invoke('save-test-account-password', accountId, password),
-  getTestAccountPassword: (accountId: string) => ipcRenderer.invoke('get-test-account-password', accountId)
+  getTestAccountPassword: (accountId: string) => ipcRenderer.invoke('get-test-account-password', accountId),
+  
+  // Phase 2 POC
+  startLiveViewPoc: (deviceId: string, maxSize?: number, videoBitRate?: number) => ipcRenderer.invoke('start-live-view-poc', deviceId, maxSize, videoBitRate),
+  stopLiveViewPoc: (deviceId: string) => ipcRenderer.invoke('stop-live-view-poc', deviceId),
+  scanMdns: () => ipcRenderer.invoke('scan-mdns'),
+  connectIp: (ip: string) => ipcRenderer.invoke('connect-ip', ip)
 });

@@ -8,10 +8,3 @@ createRoot(document.getElementById('root')!).render(
     <App />
   </StrictMode>,
 )
-
-setTimeout(async () => {
-  console.log("Renderer test: syncClipboard fromDevice");
-  const result = await (window as any).electronAPI.syncClipboard('106293738O006649', 'fromDevice');
-  console.log("Renderer test result:", result);
-  console.log("Renderer test: done");
-}, 5000);
