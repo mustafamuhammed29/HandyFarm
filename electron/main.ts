@@ -6,7 +6,8 @@ import { fork, ChildProcess, exec } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
-import { Adb } from '@devicefarmer/adbkit';
+import adbkit from '@devicefarmer/adbkit';
+const Adb = (adbkit as any).Adb || (adbkit as any).default?.Adb || (adbkit as any).default || adbkit;
 import fs from 'fs';
 import { WebSocketServer } from 'ws';
 import { Adb as YumeAdb, AdbServerClient } from '@yume-chan/adb';
@@ -68,6 +69,28 @@ for (let i = 0; i < deviceIds.length; i++) {
     }
   }
 }
+
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const nowMs = Date.now();
+for (const id of Object.keys(localDb)) {
+  const lastConnected = localDb[id].connectedAt || 0;
+  if (nowMs - lastConnected > SEVEN_DAYS_MS) {
+    console.log(`[Startup Cleanup] Purging stale device ${id} (last seen ${new Date(lastConnected).toLocaleString()})`);
+    delete localDb[id];
+    didCleanup = true;
+    continue;
+  }
+  
+  if (localDb[id].status !== 'offline') {
+    localDb[id].status = 'offline';
+    didCleanup = true;
+  }
+  if (!localDb[id].serial) {
+    localDb[id].serial = id;
+    didCleanup = true;
+  }
+}
+
 if (didCleanup) saveDb();
 
 function saveDb() {
@@ -115,24 +138,53 @@ app.on('window-all-closed', function () {
 async function startAdbTracker() {
   try {
     const tracker = await client.trackDevices();
-    tracker.on('add', (device: any) => {
-      console.log('Device added:', device.id);
-      if (!localDb[device.id]) {
-        localDb[device.id] = { id: device.id, status: device.type, connectedAt: Date.now() };
-      } else if (!localDb[device.id].connectedAt) {
-        localDb[device.id].connectedAt = Date.now();
+
+    // --- STARTUP SCAN: pick up devices already connected before the app launched ---
+    console.log('[Startup] Scanning for already-connected devices...');
+    try {
+      const existingDevices = await client.listDevices();
+      console.log(`[Startup] Found ${existingDevices.length} already-connected device(s):`, existingDevices.map((d: any) => `${d.id}(${d.type})`).join(', '));
+      for (const device of existingDevices) {
+        console.log(`[Startup] Processing pre-connected device: ${device.id} (${device.type})`);
+        if (!localDb[device.id]) {
+          localDb[device.id] = { id: device.id, serial: device.id, status: device.type, connectedAt: Date.now() };
+        } else {
+          localDb[device.id].status = device.type;
+          if (!localDb[device.id].serial) localDb[device.id].serial = device.id;
+        }
+        if (device.type === 'device' || device.type === 'unauthorized') {
+          queueWorker(device.id, device.type);
+        }
       }
-      queueWorker(device.id, device.type);
+      saveDb();
+      notifyUpdate();
+    } catch (scanErr: any) {
+      console.error('[Startup] listDevices() scan failed:', scanErr?.message || scanErr);
+    }
+    // --- END STARTUP SCAN ---
+
+    tracker.on('add', (device: any) => {
+      console.log('Device added:', device.id, device.type);
+      if (!localDb[device.id]) {
+        localDb[device.id] = { id: device.id, serial: device.id, status: device.type, connectedAt: Date.now() };
+      } else {
+        localDb[device.id].status = device.type;
+        localDb[device.id].connectedAt = Date.now();
+        if (!localDb[device.id].serial) localDb[device.id].serial = device.id;
+      }
+      saveDb();
+      notifyUpdate();
+
+      if (device.type === 'device' || device.type === 'unauthorized') {
+        queueWorker(device.id, device.type);
+      }
     });
 
     tracker.on('remove', (device: any) => {
       console.log('Device removed:', device.id);
-      
-      // If it's a USB device, mark it offline so it stays in DB with lastKnownIp
-      if (!device.id.includes(':') && localDb[device.id]) {
+      if (localDb[device.id]) {
         localDb[device.id].status = 'offline';
         saveDb();
-        notifyUpdate();
       }
 
       const worker = workers.get(device.id);
@@ -145,20 +197,24 @@ async function startAdbTracker() {
         if (qIdx >= 0) workerQueue.splice(qIdx, 1);
       }
       closeLiveView(device.id, 'Connection lost — device disconnected');
-      
-      if (localDb[device.id]) {
-          localDb[device.id].status = 'offline';
-          saveDb();
-      }
       notifyUpdate();
     });
 
     tracker.on('change', (device: any) => {
       console.log('Device changed:', device.id, device.type);
+      if (!localDb[device.id]) {
+        localDb[device.id] = { id: device.id, serial: device.id, status: device.type, connectedAt: Date.now() };
+      } else {
+        localDb[device.id].status = device.type;
+        if (!localDb[device.id].serial) localDb[device.id].serial = device.id;
+      }
+      saveDb();
+      notifyUpdate();
+
       const worker = workers.get(device.id);
       if (worker && !worker.killed && worker.connected) {
         try { worker.send({ type: 'STATUS_CHANGE', status: device.type }); } catch(e){}
-      } else {
+      } else if (device.type === 'device' || device.type === 'unauthorized') {
         queueWorker(device.id, device.type);
       }
     });
@@ -251,6 +307,9 @@ function spawnWorker(deviceId: string, status: string) {
   worker.on('message', (msg: any) => {
     if (msg.type === 'DEVICE_DATA') {
       localDb[deviceId] = { ...localDb[deviceId], ...msg.data, id: deviceId };
+      if (!localDb[deviceId].serial) {
+        localDb[deviceId].serial = deviceId;
+      }
       
       if (msg.data.serial) {
         for (const otherId in localDb) {
@@ -333,6 +392,45 @@ function notifyUpdate() {
 
 ipcMain.handle('get-devices', () => {
   return Object.values(localDb);
+});
+
+ipcMain.handle('retry-device', (_event, deviceId: string) => {
+  console.log(`[Retry] Requested for device ${deviceId}`);
+
+  // Kill any existing zombie worker
+  const existingWorker = workers.get(deviceId);
+  if (existingWorker) {
+    console.log(`[Retry] Killing existing worker for ${deviceId}`);
+    existingWorker.kill();
+    workers.delete(deviceId);
+  }
+  // Remove from queue if queued
+  const qIdx = workerQueue.findIndex(w => w.deviceId === deviceId);
+  if (qIdx >= 0) workerQueue.splice(qIdx, 1);
+
+
+  // Re-query adb for current device status
+  client.listDevices().then((devices: any[]) => {
+    const found = devices.find((d: any) => d.id === deviceId);
+    const liveStatus = found ? found.type : 'offline';
+    console.log(`[Retry] ADB reports ${deviceId} as: ${liveStatus}`);
+
+    if (localDb[deviceId]) {
+      localDb[deviceId].status = liveStatus;
+      if (!localDb[deviceId].serial) localDb[deviceId].serial = deviceId;
+      saveDb();
+      notifyUpdate();
+    }
+
+    if (liveStatus === 'device') {
+      console.log(`[Retry] Spawning fresh worker for ${deviceId}`);
+      queueWorker(deviceId, liveStatus);
+    }
+  }).catch((err: any) => {
+    console.error(`[Retry] listDevices failed: ${err?.message || err}`);
+  });
+
+  return { ok: true };
 });
 
 
@@ -541,10 +639,10 @@ ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, vi
           console.log(`[POC-TOUCH] Parsed JSON:`, msg);
           
           if (msg.type === 'touch') {
-            console.log(`[POC-TOUCH] Forwarding touch: action=${msg.action}, x=${msg.x}, y=${msg.y}, videoWidth=${msg.videoWidth}, videoHeight=${msg.videoHeight}`);
+            console.log(`[POC-TOUCH] Forwarding touch: action=${msg.action}, x=${msg.x}, y=${msg.y}, videoWidth=${msg.videoWidth}, videoHeight=${msg.videoHeight}, pointerId=${msg.pointerId}`);
             await activeScrcpyClient!.controller.injectTouch({
               action: msg.action, // 0: down, 1: up, 2: move
-              pointerId: BigInt(1),
+              pointerId: BigInt(msg.pointerId || 1),
               pointerX: msg.x,
               pointerY: msg.y,
               videoWidth: msg.videoWidth,
@@ -665,6 +763,37 @@ ipcMain.handle('reboot-device', async (_event, deviceId) => {
   }
 });
 
+async function openUrlRobust(deviceId: string, url: string) {
+  let target = '';
+  try {
+    const resolveCmd = `adb -s ${deviceId} shell pm resolve-activity -a android.intent.action.VIEW -d "${url}"`;
+    console.log(`[openUrlRobust] Resolving: ${resolveCmd}`);
+    const { stdout } = await execAsync(resolveCmd);
+    
+    // Look for something like "com.android.chrome/com.google.android.apps.chrome.Main"
+    // that indicates a resolved component
+    const match = stdout.match(/([a-zA-Z0-9_.]+\/[a-zA-Z0-9_.]+)/);
+    if (match && !stdout.includes('No activity found')) {
+      target = match[1];
+    }
+  } catch (e: any) {
+    console.warn(`[openUrlRobust] Failed to resolve activity for ${deviceId}: ${e.message}`);
+  }
+
+  const startCmd = target 
+    ? `adb -s ${deviceId} shell am start -a android.intent.action.VIEW -d "${url}" ${target}`
+    : `adb -s ${deviceId} shell am start -a android.intent.action.VIEW -d "${url}"`;
+    
+  console.log(`[openUrlRobust] Executing: ${startCmd}`);
+  try {
+    const { stdout, stderr } = await execAsync(startCmd);
+    console.log(`[openUrlRobust] Success: ${stdout} ${stderr}`);
+  } catch (e: any) {
+    console.error(`[openUrlRobust] Start failed. Exit code: ${e.code}, Stderr: ${e.stderr}, Error: ${e.message}`);
+    throw new Error(`Command failed: ${e.stderr || e.message}`);
+  }
+}
+
 ipcMain.handle('open-link', async (_event, deviceId, url) => {
   try {
     let parsed: URL;
@@ -676,8 +805,7 @@ ipcMain.handle('open-link', async (_event, deviceId, url) => {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       return { success: false, error: 'Only http: and https: protocols are allowed' };
     }
-    console.log(`[POC-OPEN-LINK] Executing: adb -s ${deviceId} shell am start -a android.intent.action.VIEW -d "${parsed.toString()}"`);
-    await execAsync(`adb -s ${deviceId} shell am start -a android.intent.action.VIEW -d "${parsed.toString()}"`);
+    await openUrlRobust(deviceId, parsed.toString());
     logAction(deviceId, `Opened link: ${parsed.toString()}`);
     return { success: true };
   } catch (e: any) {
@@ -921,6 +1049,15 @@ ipcMain.handle('clear-app-cache', async (_event, deviceId, packageName) => {
   }
 });
 
+ipcMain.handle('check-adb-status', async () => {
+  try {
+    const version = await client.version();
+    return { success: true, connected: true, version };
+  } catch (err) {
+    return { success: true, connected: false };
+  }
+});
+
 ipcMain.handle('run-adb-command', async (_event, deviceId, command) => {
   try {
     const stream = await client.getDevice(deviceId).shell(command);
@@ -944,6 +1081,52 @@ ipcMain.handle('open-settings', async (_event, deviceId, intent) => {
   } catch (e: any) {
     return { success: false, error: e.message };
   }
+});
+
+ipcMain.handle('locate-device', async (_event, deviceId) => {
+  try {
+    // Wake screen
+    await execAsync(`adb -s ${deviceId} shell input keyevent 224`).catch(() => {});
+    // Vibrate for 1 second
+    await execAsync(`adb -s ${deviceId} shell cmd vibrator vibrate 1000`).catch(() => {});
+    // Flash bright red color using browser VIEW intent
+    const dataUri = 'data:text/html,%3Chtml%3E%3Cbody%20style=%22background:red;%22%3E%3C/body%3E%3C/html%3E';
+    await openUrlRobust(deviceId, dataUri).catch((e) => {
+      console.warn(`[Locate Device] Failed to open red screen for ${deviceId}: ${e.message}`);
+    });
+    logAction(deviceId, 'Located device');
+    return { success: true };
+  } catch (e: any) {
+    return { success: false, error: e.message };
+  }
+});
+
+const activeLogcats = new Map<string, ReturnType<typeof spawn>>();
+ipcMain.handle('start-logcat', async (event, deviceId) => {
+  try {
+    if (activeLogcats.has(deviceId)) {
+      activeLogcats.get(deviceId)?.kill();
+    }
+    const proc = spawn('adb', ['-s', deviceId, 'logcat', '-v', 'time']);
+    proc.stdout.on('data', (data) => {
+       event.sender.send(`logcat-data-${deviceId}`, data.toString());
+    });
+    proc.stderr.on('data', (data) => {
+       event.sender.send(`logcat-data-${deviceId}`, data.toString());
+    });
+    activeLogcats.set(deviceId, proc);
+    return { success: true };
+  } catch (e: any) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('stop-logcat', async (_event, deviceId) => {
+  if (activeLogcats.has(deviceId)) {
+    activeLogcats.get(deviceId)?.kill();
+    activeLogcats.delete(deviceId);
+  }
+  return { success: true };
 });
 
 const secureAccountsPath = path.join(app.getPath('userData'), 'secure-accounts.json');
@@ -1028,3 +1211,53 @@ ipcMain.handle('connect-ip', async (_event, ip) => {
 
 
 
+import AppInfoParser from 'app-info-parser';
+
+ipcMain.handle('browse-apk', async () => {
+  try {
+    const res = await dialog.showOpenDialog({
+      properties: ['openFile'],
+      filters: [{ name: 'APK Files', extensions: ['apk'] }]
+    });
+    if (res.canceled || res.filePaths.length === 0) return { success: false };
+    const filePath = res.filePaths[0];
+    const stat = fs.statSync(filePath);
+    let packageName = null;
+    try {
+      const parser = new AppInfoParser(filePath);
+      const result = await parser.parse();
+      packageName = result.package;
+    } catch (e) {
+      console.error('Failed to parse APK:', e);
+    }
+    return { success: true, path: filePath, name: path.basename(filePath), size: stat.size, packageName };
+  } catch (e: any) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('parse-apk', async (_event, filePath: string) => {
+  try {
+    const stat = fs.statSync(filePath);
+    const parser = new AppInfoParser(filePath);
+    const result = await parser.parse();
+    return { success: true, path: filePath, name: path.basename(filePath), size: stat.size, packageName: result.package };
+  } catch (e: any) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('get-installed-packages', async (_event, deviceId: string) => {
+  try {
+    const stream = await client.getDevice(deviceId).shell('pm list packages -3');
+    const output = await Adb.util.readAll(stream);
+    const text = output.toString();
+    const packages = text.split('\n')
+      .map(l => l.trim())
+      .filter(l => l.startsWith('package:'))
+      .map(l => l.replace('package:', ''));
+    return { success: true, packages };
+  } catch (e: any) {
+    return { success: false, error: e.message };
+  }
+});

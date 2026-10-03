@@ -1,42 +1,89 @@
-import { Adb } from '@devicefarmer/adbkit';
-import * as deviceDb from 'stf-device-db';
+import adbkit from '@devicefarmer/adbkit';
+import deviceDbPkg from 'stf-device-db';
+
+const Adb = (adbkit as any).Adb || (adbkit as any).default?.Adb || (adbkit as any).default || adbkit;
+const deviceDb = (deviceDbPkg as any).default || deviceDbPkg;
 
 const client = Adb.createClient();
 
 const deviceId = process.argv[2];
 let status = process.argv[3];
 
+// Helper: read a single getprop value via raw adb shell
+async function getShellProp(prop: string): Promise<string> {
+  const stream = await client.getDevice(deviceId).shell(`getprop ${prop}`);
+  const chunks: Buffer[] = [];
+  return new Promise((resolve) => {
+    stream.on('data', (c: Buffer) => chunks.push(c));
+    stream.on('end', () => resolve(Buffer.concat(chunks).toString().trim()));
+    stream.on('error', () => resolve(''));
+  });
+}
+
 async function updateDeviceData() {
   if (status !== 'device') {
     // If not authorized or offline, we just send what we have
     process.send?.({
       type: 'DEVICE_DATA',
-      data: { status }
+      data: { status, serial: deviceId }
     });
     return;
   }
 
   try {
-    const properties = await client.getDevice(deviceId).getProperties();
-    
-    // Attempt to extract useful info
-    const model = properties['ro.product.model'];
-    const manufacturer = properties['ro.product.manufacturer'];
-    const serial = properties['ro.serialno'] || deviceId;
-    
-    let deviceName = model;
-    let image = null;
+    let model = '';
+    let manufacturer = '';
+    let serial = '';
 
-    // Use stf-device-db if possible
+    // --- Attempt 1: adbkit getProperties() with timing ---
+    const t0 = Date.now();
     try {
-        const dbEntry = (deviceDb as any)[model];
-        if (dbEntry) {
-            deviceName = dbEntry.name;
-        }
-    } catch (e) {
-        console.error('Failed to lookup device in stf-device-db', e);
+      const properties = await Promise.race([
+        client.getDevice(deviceId).getProperties(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('getProperties timeout after 8000ms')), 8000)
+        )
+      ]) as Record<string, string>;
+      const elapsed = Date.now() - t0;
+      console.log(`[Worker ${deviceId}] getProperties() succeeded in ${elapsed}ms`);
+      model        = properties['ro.product.model']        || '';
+      manufacturer = properties['ro.product.manufacturer'] || '';
+      serial       = properties['ro.serialno']             || '';
+    } catch (propErr: any) {
+      const elapsed = Date.now() - t0;
+      console.warn(`[Worker ${deviceId}] getProperties() FAILED after ${elapsed}ms — error: ${propErr?.message || propErr}`);
+      console.log(`[Worker ${deviceId}] Falling back to individual shell getprop calls...`);
+
+      // --- Attempt 2: individual shell getprop calls ---
+      try {
+        [model, manufacturer, serial] = await Promise.all([
+          getShellProp('ro.product.model'),
+          getShellProp('ro.product.manufacturer'),
+          getShellProp('ro.serialno'),
+        ]);
+        console.log(`[Worker ${deviceId}] Shell fallback succeeded: model=${model}, manufacturer=${manufacturer}, serial=${serial}`);
+      } catch (shellErr: any) {
+        console.error(`[Worker ${deviceId}] Shell fallback also FAILED: ${shellErr?.message || shellErr}`);
+      }
     }
 
+    // Final fallbacks
+    model        = model        || 'Unknown';
+    manufacturer = manufacturer || 'Unknown';
+    serial       = serial       || deviceId;
+
+    let deviceName = model;
+    // Use stf-device-db if possible
+    try {
+      const dbEntry = (deviceDb as any)[model];
+      if (dbEntry) {
+        deviceName = dbEntry.name;
+      }
+    } catch (e) {
+      console.error('Failed to lookup device in stf-device-db', e);
+    }
+
+    console.log(`[Worker ${deviceId}] Sending DEVICE_DATA: model=${model}, serial=${serial}, status=${status}`);
     process.send?.({
       type: 'DEVICE_DATA',
       data: {
@@ -45,15 +92,15 @@ async function updateDeviceData() {
         manufacturer,
         serial,
         name: deviceName,
-        customName: undefined, // will be merged in main
+        customName: undefined,
       }
     });
 
-  } catch (err) {
-    console.error(`Worker for ${deviceId} failed to fetch properties:`, err);
+  } catch (err: any) {
+    console.error(`[Worker ${deviceId}] Critically failed: ${err?.message || err}`);
     process.send?.({
       type: 'DEVICE_DATA',
-      data: { status: 'error' }
+      data: { status: 'error', serial: deviceId }
     });
   }
 }
@@ -83,6 +130,39 @@ async function takeScreenshot() {
 updateDeviceData();
 setTimeout(takeScreenshot, 2000);
 
+let batteryInterval: NodeJS.Timeout | null = null;
+async function checkBattery() {
+  if (status !== 'device') return;
+  try {
+    const stream = await client.getDevice(deviceId).shell('dumpsys battery');
+    const buffer = await Adb.util.readAll(stream);
+    const output = buffer.toString();
+    
+    const levelMatch = output.match(/level:\s*(\d+)/);
+    const acMatch = output.match(/AC powered:\s*(true|false)/);
+    const usbMatch = output.match(/USB powered:\s*(true|false)/);
+    const wirelessMatch = output.match(/Wireless powered:\s*(true|false)/);
+    const statusMatch = output.match(/status:\s*(\d+)/);
+    
+    if (levelMatch) {
+      const level = parseInt(levelMatch[1], 10);
+      const isCharging = (acMatch && acMatch[1] === 'true') || 
+                         (usbMatch && usbMatch[1] === 'true') || 
+                         (wirelessMatch && wirelessMatch[1] === 'true') ||
+                         (statusMatch && (statusMatch[1] === '2' || statusMatch[1] === '5'));
+                         
+      process.send?.({
+        type: 'DEVICE_DATA',
+        data: { battery: { level, charging: !!isCharging } }
+      });
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+checkBattery();
+
 let currentIntervalMs = parseInt(process.argv[4] || '10000', 10);
 
 // Listen for status changes from main process
@@ -90,11 +170,13 @@ process.on('message', (msg: any) => {
   if (msg.type === 'STATUS_CHANGE') {
     status = msg.status;
     updateDeviceData();
-    if (status === 'device' && !screenshotInterval) {
-        screenshotInterval = setInterval(takeScreenshot, currentIntervalMs);
-    } else if (status !== 'device' && screenshotInterval) {
-        clearInterval(screenshotInterval);
-        screenshotInterval = null;
+    if (status === 'device') {
+      if (!screenshotInterval) screenshotInterval = setInterval(takeScreenshot, currentIntervalMs);
+      if (!batteryInterval) batteryInterval = setInterval(checkBattery, 60000);
+      checkBattery();
+    } else {
+      if (screenshotInterval) { clearInterval(screenshotInterval); screenshotInterval = null; }
+      if (batteryInterval) { clearInterval(batteryInterval); batteryInterval = null; }
     }
   } else if (msg.type === 'UPDATE_SCREENCAP_INTERVAL') {
     currentIntervalMs = msg.interval;
@@ -117,6 +199,7 @@ process.on('message', (msg: any) => {
 // Setup interval for screenshots if already connected
 if (status === 'device') {
     screenshotInterval = setInterval(takeScreenshot, currentIntervalMs);
+    batteryInterval = setInterval(checkBattery, 60000);
 }
 
 // Keep worker alive

@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Phase 7 Actions
   exportConfig: () => ipcRenderer.invoke('export-config'),
   importConfig: () => ipcRenderer.invoke('import-config'),
+  checkAdbStatus: () => ipcRenderer.invoke('check-adb-status'),
   toggleScreen: (deviceId: string) => ipcRenderer.invoke('toggle-screen', deviceId),
   takeScreenshot: (deviceId: string) => ipcRenderer.invoke('take-screenshot', deviceId),
   syncClipboard: (deviceId: string, direction: string, text?: string) => ipcRenderer.invoke('sync-clipboard', deviceId, direction, text),
@@ -25,6 +26,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   clearAppCache: (deviceId: string, packageName: string) => ipcRenderer.invoke('clear-app-cache', deviceId, packageName),
   runAdbCommand: (deviceId: string, command: string) => ipcRenderer.invoke('run-adb-command', deviceId, command),
   openSettings: (deviceId: string, intent: string) => ipcRenderer.invoke('open-settings', deviceId, intent),
+  locateDevice: (deviceId: string) => ipcRenderer.invoke('locate-device', deviceId),
   saveTestAccountPassword: (accountId: string, password: string) => ipcRenderer.invoke('save-test-account-password', accountId, password),
   getTestAccountPassword: (accountId: string) => ipcRenderer.invoke('get-test-account-password', accountId),
   
@@ -32,5 +34,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startLiveViewPoc: (deviceId: string, maxSize?: number, videoBitRate?: number) => ipcRenderer.invoke('start-live-view-poc', deviceId, maxSize, videoBitRate),
   stopLiveViewPoc: (deviceId: string) => ipcRenderer.invoke('stop-live-view-poc', deviceId),
   scanMdns: () => ipcRenderer.invoke('scan-mdns'),
-  connectIp: (ip: string) => ipcRenderer.invoke('connect-ip', ip)
+  connectIp: (ip: string) => ipcRenderer.invoke('connect-ip', ip),
+  startLogcat: (deviceId: string) => ipcRenderer.invoke('start-logcat', deviceId),
+  stopLogcat: (deviceId: string) => ipcRenderer.invoke('stop-logcat', deviceId),
+  onLogcatData: (deviceId: string, callback: (data: string) => void) => {
+    ipcRenderer.on(`logcat-data-${deviceId}`, (_event, data) => callback(data));
+  },
+  offLogcatData: (deviceId: string) => {
+    ipcRenderer.removeAllListeners(`logcat-data-${deviceId}`);
+  }
+,
+  browseApk: () => ipcRenderer.invoke('browse-apk'),
+  parseApk: (filePath: string) => ipcRenderer.invoke('parse-apk', filePath),
+  getInstalledPackages: (deviceId: string) => ipcRenderer.invoke('get-installed-packages', deviceId),
+  retryDevice: (deviceId: string) => ipcRenderer.invoke('retry-device', deviceId),
 });
+
+

@@ -1,8 +1,8 @@
 :root {
-  --status-green: #10b981;
-  --status-red: #ef4444;
-  --status-yellow: #f59e0b;
-  --status-gray: #6b7280;
+  --status-online: #10b981;
+  --status-warning: #f59e0b;
+  --status-error: #ef4444;
+  --status-offline: #6b7280;
   
   --bg-color: #0f172a;
   --card-bg: #1e293b;
@@ -201,6 +201,52 @@ body {
   cursor: not-allowed;
 }
 
+/* Custom Toggle Switch for Selection Action Bar */
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 34px;
+  height: 20px;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: var(--border);
+  transition: .2s;
+  border-radius: 20px;
+}
+
+.toggle-slider:before {
+  position: absolute;
+  content: "";
+  height: 16px;
+  width: 16px;
+  left: 2px;
+  bottom: 2px;
+  background-color: white;
+  transition: .2s;
+  border-radius: 50%;
+}
+
+.toggle-switch.on .toggle-slider {
+  background-color: var(--status-online);
+}
+
+.toggle-switch.on .toggle-slider:before {
+  transform: translateX(14px);
+}
+
 /* Main Content */
 .main-content {
   flex: 1;
@@ -361,8 +407,8 @@ body {
 }
 
 .thumb-card.is-focused {
-  border-color: var(--status-green);
-  box-shadow: 0 0 0 2px var(--status-green);
+  border-color: var(--status-online);
+  box-shadow: 0 0 0 2px var(--status-online);
 }
 
 .thumb-checkbox {
@@ -427,10 +473,10 @@ body {
   border-radius: 50%;
 }
 
-.status-dot.green { background: var(--status-green); }
-.status-dot.red { background: var(--status-red); }
-.status-dot.yellow { background: var(--status-yellow); }
-.status-dot.gray { background: var(--status-gray); }
+.status-dot.online { background: var(--status-online); }
+.status-dot.error { background: var(--status-error); }
+.status-dot.warning { background: var(--status-warning); }
+.status-dot.offline { background: var(--status-offline); }
 
 /* Settings Modal */
 .modal-overlay {
@@ -535,12 +581,12 @@ body {
   padding: 12px;
   border-radius: 8px;
   background: var(--bg-color);
-  border-left: 4px solid var(--status-gray);
+  border-left: 4px solid var(--status-offline);
 }
-.result-item.success { border-left-color: var(--status-green); }
-.result-item.failure { border-left-color: var(--status-red); }
+.result-item.success { border-left-color: var(--status-online); }
+.result-item.failure { border-left-color: var(--status-error); }
 .result-item-title { font-weight: 600; font-size: 14px; }
-.result-item-error { font-size: 12px; color: var(--status-red); }
+.result-item-error { font-size: 12px; color: var(--status-error); }
 
 /* Scrollbar */
 ::-webkit-scrollbar {
@@ -559,6 +605,22 @@ body {
 }
 .thumb-actions.hover-only { opacity: 0; transition: opacity 0.2s; }
 .thumb-card:hover .thumb-actions.hover-only { opacity: 1; }
-. t h u m b - a c t i o n s . h o v e r - o n l y   {   o p a c i t y :   0 ;   t r a n s i t i o n :   o p a c i t y   0 . 2 s ;   }  
- . t h u m b - c a r d : h o v e r   . t h u m b - a c t i o n s . h o v e r - o n l y   {   o p a c i t y :   1 ;   }  
- 
+
+.thumb-actions-bar {
+  opacity: 0;
+  transition: opacity 0.2s;
+  pointer-events: none;
+}
+.thumb-card:hover .thumb-actions-bar,
+.thumb-actions-bar.always-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.spin {
+  animation: spin 2s linear infinite;
+}

@@ -1,13 +1,15 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { 
   Smartphone, XCircle, Play, CheckSquare, Square, RefreshCw, Link as LinkIcon, Download, 
-  Moon, Sun, Pin, PinOff, Settings, Search, 
-  Terminal, Power, FileUp, FileDown, Save, Key, History, Copy, Wifi
+  Moon, Sun, Pin, PinOff, Settings, Search,
+  Terminal, FileUp, FileDown, Save, Key, History, Copy, Wifi, FileText,
+  CheckCircle2, AlertTriangle, MinusCircle, Home, ArrowLeft, ChevronDown, ChevronRight, Folder
 } from 'lucide-react';
 import './App.css';
 import type { DeviceData, QuickPhrase, TestAccount } from './types';
 import { LiveViewPoc } from './components/LiveViewPoc';
 import type { LiveViewPocRef } from './components/LiveViewPoc';
+import { LogcatViewer } from './components/LogcatViewer';
 
 function App() {
   const [devices, setDevices] = useState<DeviceData[]>([]);
@@ -16,9 +18,11 @@ function App() {
   const [results, setResults] = useState<{deviceId: string, success: boolean, error?: string, action: string}[] | null>(null);
   
   const [focusedDeviceId, setFocusedDeviceId] = useState<string | null>(null);
+  const [showLogcatDeviceId, setShowLogcatDeviceId] = useState<string | null>(null);
   const [sidebarPinned, setSidebarPinned] = useState(true);
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [searchQuery, setSearchQuery] = useState('');
+  const [showOffline, setShowOffline] = useState(false);
   const [isMirrorMode, setIsMirrorMode] = useState(false);
   const liveViewRefs = useRef<{ [key: string]: LiveViewPocRef | null }>({});
   const [gridDensity, setGridDensity] = useState<'compact' | 'normal' | 'large'>(
@@ -34,6 +38,41 @@ function App() {
   }, [gridDensity, zoomLevel]);
 
   // Phase 7 state
+  const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set(['Selection']));
+  const toggleSection = (section: string) => {
+    const newSet = new Set(expandedSections);
+    if (newSet.has(section)) newSet.delete(section);
+    else newSet.add(section);
+    setExpandedSections(newSet);
+  };
+  
+  // Phase 4 states
+  const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
+  const [timeSinceUpdate, setTimeSinceUpdate] = useState<number>(0);
+  const [adbConnected, setAdbConnected] = useState<boolean>(false);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setTimeSinceUpdate(Math.floor((Date.now() - lastUpdated.getTime()) / 1000));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [lastUpdated]);
+
+  const checkAdbStatus = async () => {
+    try {
+      const res = await window.electronAPI.checkAdbStatus();
+      setAdbConnected(res?.connected ?? false);
+    } catch {
+      setAdbConnected(false);
+    }
+  };
+
+  useEffect(() => {
+    checkAdbStatus();
+    const interval = setInterval(checkAdbStatus, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
   const [activeTagFilter, setActiveTagFilter] = useState('');
   const [allTags, setAllTags] = useState<string[]>([]);
   const [showAdbConsole, setShowAdbConsole] = useState(false);
@@ -50,6 +89,50 @@ function App() {
   // Phase 7 Distinct Distribution State
   const [showDistributionModal, setShowDistributionModal] = useState(false);
   const [distributionMapping, setDistributionMapping] = useState<{deviceId: string, textLine: string}[]>([]);
+  
+  // Phase 5 states
+  const [apkMetadata, setApkMetadata] = useState<{name: string, size: number} | null>(null);
+  const [installedPackages, setInstalledPackages] = useState<string[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
+
+  const handleBrowseApk = async () => {
+    const res = await window.electronAPI.browseApk();
+    if (res.success && res.path) {
+      setApkPath(res.path);
+      setApkMetadata({ name: res.name || '', size: res.size || 0 });
+      if (res.packageName) setAppPackageName(res.packageName);
+    }
+  };
+
+  const handleDropApk = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const file = e.dataTransfer.files[0];
+      if (file.name.endsWith('.apk')) {
+        const filePath = (file as any).path;
+        if (filePath) {
+          const res = await window.electronAPI.parseApk(filePath);
+          if (res.success) {
+            setApkPath(res.path || filePath);
+            setApkMetadata({ name: res.name || file.name, size: res.size || file.size });
+            if (res.packageName) setAppPackageName(res.packageName);
+          }
+        }
+      }
+    }
+  };
+
+  const handleFetchPackages = async () => {
+    if (selectedIds.size === 0) {
+      return; // Fallback to normal behavior if no device selected
+    }
+    const firstId = Array.from(selectedIds)[0];
+    const res = await window.electronAPI.getInstalledPackages(firstId);
+    if (res.success && res.packages) {
+      setInstalledPackages(res.packages);
+    }
+  };
   
   const [singleTargetId, setSingleTargetId] = useState('');
   const [singleTargetText, setSingleTargetText] = useState('');
@@ -124,9 +207,10 @@ function App() {
   }, []);
 
   useEffect(() => {
-    window.electronAPI.getDevices().then(setDevices);
+    window.electronAPI.getDevices().then(d => { setDevices(d); setLastUpdated(new Date()); });
     window.electronAPI.onDevicesUpdated((updatedDevices) => {
       setDevices(updatedDevices);
+      setLastUpdated(new Date());
       // Extract all unique tags
       const tags = new Set<string>();
       updatedDevices.forEach(d => d.tags?.forEach(t => tags.add(t)));
@@ -138,14 +222,16 @@ function App() {
   const toggleSidebar = () => setSidebarPinned(p => !p);
 
   const getFilteredDevices = () => {
+    console.log("All devices before filter:", JSON.parse(JSON.stringify(devices)));
     // Hide fully offline devices, and devices that haven't been resolved yet (no serial or undefined status)
-    let filtered = devices.filter(d => 
-      d.status !== 'offline' && 
-      d.status !== 'disconnect' && 
-      d.status !== undefined && 
-      d.status !== 'undefined' &&
-      d.serial // Only show devices that have successfully fetched their properties
-    );
+    let filtered = devices.filter(d => {
+      const isVisible = (showOffline || (d.status !== 'offline' && d.status !== 'disconnect')) && 
+                        d.status !== undefined && 
+                        d.status !== 'undefined' &&
+                        !!d.serial;
+      console.log(`Device ID: ${d.id} | Serial: ${d.serial} | Status: ${d.status} | Passes Filter? ${isVisible}`);
+      return isVisible;
+    });
     
     if (activeTagFilter) {
       filtered = filtered.filter(d => d.tags?.includes(activeTagFilter));
@@ -157,7 +243,9 @@ function App() {
         (d.name && d.name.toLowerCase().includes(lowerQ)) ||
         (d.model && d.model.toLowerCase().includes(lowerQ)) ||
         (d.status && d.status.toLowerCase().includes(lowerQ)) ||
-        (d.serial && d.serial.toLowerCase().includes(lowerQ))
+        (d.serial && d.serial.toLowerCase().includes(lowerQ)) ||
+        (d.id && d.id.toLowerCase().includes(lowerQ)) ||
+        (d.lastKnownIp && d.lastKnownIp.toLowerCase().includes(lowerQ))
       );
     }
     return filtered;
@@ -199,6 +287,7 @@ function App() {
     }
   }, [isMirrorMode, selectedIds]);
 
+  /*
   const handleSwitchToWireless = async (deviceId: string) => {
     setActionInProgress(true);
     const res = await window.electronAPI.switchToWireless(deviceId);
@@ -209,6 +298,7 @@ function App() {
       alert(`Successfully switched device ${deviceId} to Wireless ADB at ${res.ip}:5555. You can now unplug the USB cable.`);
     }
   };
+  */
 
   const toggleSelectAll = () => {
     if (selectedIds.size === visibleDevices.length && visibleDevices.length > 0) {
@@ -262,7 +352,15 @@ function App() {
           case 'reboot': res = await window.electronAPI.rebootDevice(id); break;
           case 'openLink': res = await window.electronAPI.openLink(id, payload); break;
           case 'installApk': res = await window.electronAPI.installApk(id, payload); break;
-          case 'sendText': res = await window.electronAPI.sendText(id, payload); break;
+          case 'sendText': {
+            let p = payload;
+            const device = devices.find(d => d.id === id);
+            if (device && typeof p === 'string') {
+              p = p.replace(/{serial}/g, device.serial || '').replace(/{model}/g, device.model || '');
+            }
+            res = await window.electronAPI.sendText(id, p); 
+            break;
+          }
           case 'launchApp': res = await window.electronAPI.launchApp(id, payload); break;
           case 'clearCache': res = await window.electronAPI.clearAppCache(id, payload); break;
           case 'settings': res = await window.electronAPI.openSettings(id, payload); break;
@@ -288,8 +386,13 @@ function App() {
      if (!deviceId || !text) return;
      setActionInProgress(true);
      setResults(null);
+     let processedText = text;
+     const device = devices.find(d => d.id === deviceId);
+     if (device) {
+       processedText = processedText.replace(/{serial}/g, device.serial || '').replace(/{model}/g, device.model || '');
+     }
      try {
-       const res = await window.electronAPI.sendText(deviceId, text);
+       const res = await window.electronAPI.sendText(deviceId, processedText);
        setResults([{ deviceId, success: res.success, error: res.error, action: 'sendText' }]);
      } catch (e: any) {
        setResults([{ deviceId, success: false, error: e.message, action: 'sendText' }]);
@@ -401,151 +504,234 @@ function App() {
 
         <div className="sidebar-content">
           <div className="action-section">
-            <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
-              <h3>Selection ({selectedIds.size})</h3>
+            <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', cursor: 'pointer', userSelect: 'none'}} onClick={() => toggleSection('Selection')}>
+              <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                {expandedSections.has('Selection') ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                <h3 style={{margin: 0}}>Selection ({selectedIds.size})</h3>
+              </div>
               <span style={{fontSize:'11px', color:'var(--text-muted)'}}>Alt+Click = Focused Only</span>
             </div>
-            <div style={{display: 'flex', gap: '8px', marginTop: '8px'}}>
-              <button className="large-btn" style={{flex: 1}} onClick={toggleSelectAll}>
-                {selectedIds.size === visibleDevices.length && visibleDevices.length > 0 ? <CheckSquare size={20} className="text-accent" /> : <Square size={20} />}
-                {selectedIds.size === visibleDevices.length && visibleDevices.length > 0 ? 'Deselect All' : 'Select All'}
-              </button>
-              
-
-              <button 
-                className={`large-btn ${isMirrorMode ? 'primary' : ''}`}  
-                style={{flex: 1}} 
-                onClick={() => setIsMirrorMode(!isMirrorMode)}
-              >
-                <Copy size={20} />
-                Mirror Input {isMirrorMode ? 'ON' : 'OFF'}
-              </button>
-            </div>
-            
-            <div style={{display: 'flex', gap: '8px', marginTop: '8px'}}>
-              <button className="large-btn" style={{flex: 1, padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={handleImport} title="Import Config"><FileDown size={16}/> Import</button>
-              <button className="large-btn" style={{flex: 1, padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={handleExport} title="Export Config"><FileUp size={16}/> Export</button>
-            </div>
+            {expandedSections.has('Selection') && (
+              <>
+                <div style={{display: 'flex', gap: '8px', marginTop: '12px'}}>
+                  <button className="large-btn" style={{flex: 1, padding: '8px 12px', height: '36px', fontSize: '13px', justifyContent: 'center'}} onClick={toggleSelectAll}>
+                    {selectedIds.size === visibleDevices.length && visibleDevices.length > 0 ? <CheckSquare size={16} className="text-accent" /> : <Square size={16} />}
+                    {selectedIds.size === visibleDevices.length && visibleDevices.length > 0 ? 'Deselect All' : 'Select All'}
+                  </button>
+                  <button 
+                    className="large-btn"
+                    style={{flex: 1, padding: '8px 12px', height: '36px', fontSize: '13px', justifyContent: 'space-between', backgroundColor: isMirrorMode ? 'rgba(16, 185, 129, 0.1)' : 'var(--bg-color)', borderColor: isMirrorMode ? 'var(--status-online)' : 'var(--border)'}} 
+                    onClick={() => setIsMirrorMode(!isMirrorMode)}
+                  >
+                    <div style={{display: 'flex', alignItems: 'center', gap: '6px'}}>
+                      <Copy size={16} color={isMirrorMode ? 'var(--status-online)' : 'inherit'} />
+                      <span style={{color: isMirrorMode ? 'var(--status-online)' : 'inherit', fontWeight: isMirrorMode ? '600' : 'normal'}}>Mirror Input</span>
+                    </div>
+                    <div className={`toggle-switch ${isMirrorMode ? 'on' : 'off'}`}>
+                      <div className="toggle-slider"></div>
+                    </div>
+                  </button>
+                </div>
+                
+                <div style={{ height: '1px', background: 'var(--border)', margin: '12px 0', opacity: 0.5 }}></div>
+                
+                <div style={{display: 'flex', gap: '8px'}}>
+                  <button className="large-btn" style={{flex: 1, padding: '8px 12px', height: '36px', fontSize: '13px', justifyContent: 'center'}} onClick={handleImport} title="Import Config"><FileDown size={16}/> Import</button>
+                  <button className="large-btn" style={{flex: 1, padding: '8px 12px', height: '36px', fontSize: '13px', justifyContent: 'center'}} onClick={handleExport} title="Export Config"><FileUp size={16}/> Export</button>
+                </div>
+                
+                <div style={{display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '12px', background: 'var(--bg-color)', padding: '8px', borderRadius: '8px'}}>
+                  <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between'}}>
+                    <span style={{fontSize: '12px', color: 'var(--text-muted)'}}>Action Delay (ms):</span>
+                    <input type="number" value={batchDelay} onChange={e => setBatchDelay(parseInt(e.target.value) || 0)} style={{width: '60px', padding: '4px', background: 'var(--card-bg)', color: 'var(--text-main)', border: '1px solid var(--border)', borderRadius: '4px'}} />
+                  </div>
+                  <span style={{fontSize: '10px', color: 'var(--text-muted)', fontStyle: 'italic', opacity: 0.8}}>Pause between commands when sending to multiple devices</span>
+                </div>
+              </>
+            )}
           </div>
 
           <div className="action-section">
-            <h3>Batch App & Files</h3>
-            <div style={{display: 'flex', gap: '8px', background: 'var(--bg-color)', padding: '8px', borderRadius: '8px'}}>
-              <input type="text" placeholder="APK Path" value={apkPath} onChange={e => setApkPath(e.target.value)} style={{flex: 1, padding: '8px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)'}} />
-              <button className="icon-btn active" disabled={actionInProgress || !apkPath} onClick={(e) => executeBulkAction('installApk', apkPath, e)} title="Install APK">
-                <Download size={18} />
-              </button>
+            <div style={{display:'flex', alignItems:'center', gap:'8px', cursor: 'pointer', userSelect: 'none'}} onClick={() => toggleSection('Batch App')}>
+              {expandedSections.has('Batch App') ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+              <h3 style={{margin: 0}}>Batch App & Files</h3>
             </div>
-            <div style={{display: 'flex', gap: '8px', background: 'var(--bg-color)', padding: '8px', borderRadius: '8px', marginTop: '8px'}}>
-              <input type="text" placeholder="URL" value={url} onChange={e => setUrl(e.target.value)} style={{flex: 1, padding: '8px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)'}} />
-              <button className="icon-btn active" disabled={actionInProgress || !url} onClick={(e) => executeBulkAction('openLink', url, e)} title="Open Link">
-                <LinkIcon size={18} />
-              </button>
-            </div>
-            <div style={{display: 'flex', gap: '8px', background: 'var(--bg-color)', padding: '8px', borderRadius: '8px'}}>
-              <input type="text" placeholder="Package name" value={appPackageName} onChange={e => setAppPackageName(e.target.value)} style={{flex: 1, padding: '8px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)'}} />
-              <button className="icon-btn active" onClick={(e) => executeBulkAction('launchApp', appPackageName, e)} title="Launch App"><Play size={18}/></button>
-              <button className="icon-btn active" onClick={(e) => executeBulkAction('clearCache', appPackageName, e)} title="Clear Cache"><RefreshCw size={18}/></button>
-            </div>
+            {expandedSections.has('Batch App') && (
+              <>
+                <div 
+                  style={{display: 'flex', flexDirection: 'column', gap: '8px', background: isDragging ? 'rgba(139, 92, 246, 0.1)' : 'var(--bg-color)', padding: '12px', borderRadius: '8px', marginTop: '12px', border: isDragging ? '2px dashed var(--accent)' : '1px solid transparent'}}
+                  onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+                  onDragLeave={() => setIsDragging(false)}
+                  onDrop={handleDropApk}
+                >
+                  <div style={{display: 'flex', gap: '8px', alignItems: 'center'}}>
+                    <button className="secondary-btn" onClick={handleBrowseApk} style={{padding: '8px 12px', display: 'flex', alignItems: 'center', gap: '8px'}}>
+                      <Folder size={18} /> Browse APK...
+                    </button>
+                    <button className="icon-btn active" disabled={actionInProgress || !apkPath} onClick={(e) => executeBulkAction('installApk', apkPath, e)} title="Install & Launch">
+                      <Download size={18} />
+                    </button>
+                  </div>
+                  {apkMetadata ? (
+                    <div style={{fontSize: '12px', color: 'var(--text-main)', display: 'flex', justifyContent: 'space-between'}}>
+                      <span title={apkPath} style={{maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>{apkMetadata.name}</span>
+                      <span style={{color: 'var(--text-muted)'}}>{(apkMetadata.size / (1024*1024)).toFixed(2)} MB</span>
+                    </div>
+                  ) : (
+                    <div style={{fontSize: '11px', color: 'var(--text-muted)', textAlign: 'center'}}>
+                      Or drag and drop an .apk file here
+                    </div>
+                  )}
+                </div>
+                <div style={{display: 'flex', gap: '8px', background: 'var(--bg-color)', padding: '8px', borderRadius: '8px', marginTop: '8px'}}>
+                  <input type="text" placeholder="URL" value={url} onChange={e => setUrl(e.target.value)} style={{flex: 1, padding: '8px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)'}} />
+                  <button className="icon-btn active" disabled={actionInProgress || !url} onClick={(e) => executeBulkAction('openLink', url, e)} title="Open Link">
+                    <LinkIcon size={18} />
+                  </button>
+                </div>
+                <div style={{display: 'flex', gap: '8px', background: 'var(--bg-color)', padding: '8px', borderRadius: '8px', marginTop: '8px'}}>
+                  <input list="installed-packages" type="text" placeholder="Package name" value={appPackageName} onChange={e => setAppPackageName(e.target.value)} onFocus={handleFetchPackages} style={{flex: 1, padding: '8px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)'}} />
+                  <datalist id="installed-packages">
+                    {installedPackages.map(pkg => <option key={pkg} value={pkg} />)}
+                  </datalist>
+                  <button className="icon-btn active" onClick={(e) => executeBulkAction('launchApp', appPackageName, e)} title="Launch App"><Play size={18}/></button>
+                  <button className="icon-btn active" onClick={handleFetchPackages} title="Refresh installed apps list"><RefreshCw size={18}/></button>
+                </div>
+              </>
+            )}
           </div>
 
           <div className="action-section">
-            <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
-              <h3>Batch Data Input</h3>
+            <div style={{display:'flex', alignItems:'center', gap:'8px', cursor: 'pointer', userSelect: 'none'}} onClick={() => toggleSection('Batch Data')}>
+              {expandedSections.has('Batch Data') ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+              <h3 style={{margin: 0}}>Batch Data Input</h3>
             </div>
-            <div style={{fontSize: '11px', color: 'var(--text-muted)', marginBottom: '4px'}}>
-              * Note: Bulk actions send the <strong>identical</strong> content to all selected devices. For distinct per-device content, use <strong>"Distribute from File"</strong> below, or the <strong>Single Device Target</strong> tool.
-            </div>
-            <div style={{display: 'flex', flexDirection: 'column', gap: '8px', background: 'var(--bg-color)', padding: '12px', borderRadius: '8px'}}>
-              <input type="text" placeholder="Text to send..." value={textToSend} onChange={e => setTextToSend(e.target.value)} style={{padding: '8px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)'}} />
-              <div style={{display: 'flex', gap: '8px'}}>
-                <button className="large-btn primary" style={{flex: 1, padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={(e) => executeBulkAction('sendText', textToSend, e)}>Send Text</button>
-                <button className="large-btn" style={{flex: 1, padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={() => {
-                  if(textToSend) {
-                    const newP = [...quickPhrases, {id: Date.now().toString(), label: textToSend.substring(0, 10), text: textToSend}];
-                    setQuickPhrases(newP);
-                    localStorage.setItem('quickPhrases', JSON.stringify(newP));
-                  }
-                }}><Save size={16}/> Save</button>
+            {expandedSections.has('Batch Data') && (
+              <>
+                <div style={{fontSize: '11px', color: 'var(--text-muted)', marginBottom: '4px', marginTop: '12px'}}>
+                  * Note: Bulk actions send the <strong>identical</strong> content to all selected devices. For distinct per-device content, use <strong>"Distribute from File"</strong> below, or the <strong>Single Device Target</strong> tool.
+                </div>
+                <div style={{display: 'flex', flexDirection: 'column', gap: '8px', background: 'var(--bg-color)', padding: '12px', borderRadius: '8px'}}>
+                  <textarea 
+                    placeholder="Text to send... Supports variables like {serial} and {model}" 
+                    value={textToSend} 
+                    onChange={e => setTextToSend(e.target.value)} 
+                    style={{padding: '8px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)', resize: 'vertical', minHeight: '60px', fontFamily: 'inherit', fontSize: '13px'}} 
+                  />
+                  <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+                    <span style={{fontSize: '11px', color: 'var(--text-muted)'}}>{textToSend.length} character(s)</span>
+                    {selectedIds.size > 0 && <span style={{fontSize: '11px', color: 'var(--accent)', fontWeight: 'bold'}}>This will send to {selectedIds.size} selected device(s)</span>}
+                  </div>
+                  <div style={{display: 'flex', gap: '8px'}}>
+                    <button className="large-btn primary" style={{flex: 1, padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={(e) => executeBulkAction('sendText', textToSend, e)}>Send Text</button>
+                    <button className="large-btn" title="Save current text as a reusable template in Quick Phrases" style={{flex: 1, padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={() => {
+                      if(textToSend) {
+                        const newP = [...quickPhrases, {id: Date.now().toString(), label: textToSend.substring(0, 10), text: textToSend}];
+                        setQuickPhrases(newP);
+                        localStorage.setItem('quickPhrases', JSON.stringify(newP));
+                      }
+                    }}><Save size={16}/> Save</button>
+                  </div>
+                  {quickPhrases.length > 0 && (
+                    <select onChange={(e) => setTextToSend(e.target.value)} style={{padding: '8px', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)', border: '1px solid var(--border)'}}>
+                      <option value="">-- Quick Phrases --</option>
+                      {quickPhrases.map(p => <option key={p.id} value={p.text}>{p.label}</option>)}
+                    </select>
+                  )}
+                  
+                  <div style={{display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '4px'}}>
+                    <label className="large-btn" style={{padding: '8px', fontSize: '14px', justifyContent: 'center', cursor: 'pointer', background: 'var(--card-bg)'}}>
+                      <FileUp size={16}/> Distribute from File (.txt)
+                      <input type="file" accept=".txt,.csv" style={{display: 'none'}} onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        if (selectedIds.size === 0) {
+                          setGlobalMessage("Please select target devices first.");
+                          return;
+                        }
+                        const reader = new FileReader();
+                        reader.onload = (evt) => {
+                          const text = evt.target?.result as string;
+                          const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
+                          const selectedArray = visibleDevices.filter(d => selectedIds.has(d.id));
+                          const initialMapping = selectedArray.map((dev, idx) => ({
+                            deviceId: dev.id,
+                            textLine: lines[idx] || ''
+                          }));
+                          setDistributionMapping(initialMapping);
+                          setShowDistributionModal(true);
+                          e.target.value = ''; // reset
+                        };
+                        reader.readAsText(file);
+                      }} />
+                    </label>
+                    <span style={{fontSize: '11px', color: 'var(--text-muted)', textAlign: 'center'}}>One line per device, matching the order shown in the device grid.</span>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="action-section">
+            <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', cursor: 'pointer', userSelect: 'none'}} onClick={() => toggleSection('Accounts')}>
+              <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                {expandedSections.has('Accounts') ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                <h3 style={{margin: 0}}>Internal Handyland Accounts</h3>
               </div>
-              {quickPhrases.length > 0 && (
-                <select onChange={(e) => setTextToSend(e.target.value)} style={{padding: '8px', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)', border: '1px solid var(--border)'}}>
-                  <option value="">-- Quick Phrases --</option>
-                  {quickPhrases.map(p => <option key={p.id} value={p.text}>{p.label}</option>)}
+              <button className="icon-btn" style={{padding: '2px', color: '#8b5cf6'}} onClick={(e) => { e.stopPropagation(); setShowAccountsModal(true); }} title="Manage Accounts">
+                <Settings size={14}/>
+              </button>
+            </div>
+            {expandedSections.has('Accounts') && (
+              <div style={{display: 'flex', flexDirection: 'column', gap: '8px', background: 'rgba(139, 92, 246, 0.1)', border: '1px solid #8b5cf6', padding: '12px', borderRadius: '8px', marginTop: '12px'}}>
+                <select id="testAccountSelect" style={{padding: '8px', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)', border: '1px solid var(--border)'}}>
+                  {testAccounts.map(a => <option key={a.id} value={a.username}>{a.label || a.username}</option>)}
                 </select>
-              )}
-              
-              <div style={{display: 'flex', gap: '8px', marginTop: '4px'}}>
-                <label className="large-btn" style={{flex: 1, padding: '8px', fontSize: '14px', justifyContent: 'center', cursor: 'pointer', background: 'var(--card-bg)'}}>
-                  <FileUp size={16}/> Distribute from File (.txt)
-                  <input type="file" accept=".txt,.csv" style={{display: 'none'}} onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    if (!file) return;
-                    if (selectedIds.size === 0) {
-                      setGlobalMessage("Please select target devices first.");
-                      return;
-                    }
-                    const reader = new FileReader();
-                    reader.onload = (evt) => {
-                      const text = evt.target?.result as string;
-                      const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
-                      const selectedArray = visibleDevices.filter(d => selectedIds.has(d.id));
-                      const initialMapping = selectedArray.map((dev, idx) => ({
-                        deviceId: dev.id,
-                        textLine: lines[idx] || ''
-                      }));
-                      setDistributionMapping(initialMapping);
-                      setShowDistributionModal(true);
-                      e.target.value = ''; // reset
-                    };
-                    reader.readAsText(file);
-                  }} />
-                </label>
+                <button className="large-btn" style={{padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={(e) => {
+                  const val = (document.getElementById('testAccountSelect') as HTMLSelectElement).value;
+                  executeBulkAction('sendText', val, e);
+                }}><Key size={16}/> Inject Username</button>
               </div>
-            </div>
-
-            <div style={{display: 'flex', flexDirection: 'column', gap: '8px', background: 'rgba(139, 92, 246, 0.1)', border: '1px solid #8b5cf6', padding: '12px', borderRadius: '8px'}}>
-              <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
-                <span style={{fontSize: '12px', fontWeight: 'bold', color: '#8b5cf6'}}>INTERNAL HANDYLAND ACCOUNTS</span>
-                <button className="icon-btn" style={{padding: '2px', color: '#8b5cf6'}} onClick={() => setShowAccountsModal(true)} title="Manage Accounts">
-                  <Settings size={14}/>
-                </button>
-              </div>
-              <select id="testAccountSelect" style={{padding: '8px', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)', border: '1px solid var(--border)'}}>
-                {testAccounts.map(a => <option key={a.id} value={a.username}>{a.label || a.username}</option>)}
-              </select>
-              <button className="large-btn" style={{padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={(e) => {
-                const val = (document.getElementById('testAccountSelect') as HTMLSelectElement).value;
-                executeBulkAction('sendText', val, e);
-              }}><Key size={16}/> Inject Username</button>
-            </div>
-          </div>
-          
-          <div className="action-section">
-            <h3>Quick Intents</h3>
-            <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px'}}>
-              <button className="large-btn" style={{padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={(e) => executeBulkAction('settings', 'wifi', e)}>Wi-Fi</button>
-              <button className="large-btn" style={{padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={(e) => executeBulkAction('settings', 'ime', e)}>Keyboard</button>
-              <button className="large-btn" style={{padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={(e) => executeBulkAction('settings', 'accessibility', e)}>Access</button>
-              <button className="large-btn danger" style={{padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={(e) => executeBulkAction('reboot', null, e)}><Power size={16}/> Reboot</button>
-            </div>
-            
-            <div style={{display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px'}}>
-              <span style={{fontSize: '12px', color: 'var(--text-muted)'}}>Action Delay (ms):</span>
-              <input type="number" value={batchDelay} onChange={e => setBatchDelay(parseInt(e.target.value) || 0)} style={{width: '60px', padding: '4px', background: 'var(--bg-color)', color: 'var(--text-main)', border: '1px solid var(--border)', borderRadius: '4px'}} />
-            </div>
+            )}
           </div>
 
           <div className="action-section">
-            <h3>Single Device Target</h3>
-            <div style={{display: 'flex', flexDirection: 'column', gap: '8px', background: 'var(--bg-color)', padding: '12px', borderRadius: '8px'}}>
-              <select value={singleTargetId} onChange={e => setSingleTargetId(e.target.value)} style={{padding: '8px', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)', border: '1px solid var(--border)'}}>
-                <option value="">-- Select a specific device --</option>
-                {visibleDevices.map(d => <option key={d.id} value={d.id}>{d.customName || d.name || d.model} ({d.id})</option>)}
-              </select>
-              <input type="text" placeholder="Text to send..." value={singleTargetText} onChange={e => setSingleTargetText(e.target.value)} style={{padding: '8px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)'}} />
-              <button className="large-btn primary" disabled={!singleTargetId || !singleTargetText || actionInProgress} style={{padding: '8px', fontSize: '14px', justifyContent: 'center'}} onClick={() => executeSingleTarget(singleTargetId, singleTargetText)}>Send to this device only</button>
+            <div style={{display:'flex', alignItems:'center', gap:'8px', cursor: 'pointer', userSelect: 'none'}} onClick={() => toggleSection('Single Target')}>
+              {expandedSections.has('Single Target') ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+              <h3 style={{margin: 0}}>Single Device Target</h3>
             </div>
+            {expandedSections.has('Single Target') && (
+              <div style={{display: 'flex', flexDirection: 'column', gap: '8px', background: 'var(--bg-color)', padding: '12px', borderRadius: '8px', marginTop: '12px'}}>
+                <select value={singleTargetId} onChange={e => setSingleTargetId(e.target.value)} style={{padding: '8px', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)', border: '1px solid var(--border)'}}>
+                  <option value="">-- Select a specific device --</option>
+                  {visibleDevices.map(d => <option key={d.id} value={d.id}>{d.status === 'device' ? '🟢' : '⚪'} {d.customName || d.name || d.model} ({d.id})</option>)}
+                </select>
+                <textarea 
+                  placeholder="Text to send... Supports variables like {serial} and {model}" 
+                  value={singleTargetText} 
+                  onChange={e => setSingleTargetText(e.target.value)} 
+                  style={{padding: '8px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--card-bg)', color: 'var(--text-main)', resize: 'vertical', minHeight: '60px', fontFamily: 'inherit', fontSize: '13px'}} 
+                />
+                <div style={{display: 'flex', justifyContent: 'flex-start'}}>
+                  <span style={{fontSize: '11px', color: 'var(--text-muted)'}}>{singleTargetText.length} character(s)</span>
+                </div>
+                {(() => {
+                  const targetDevice = devices.find(d => d.id === singleTargetId);
+                  const isOffline = targetDevice && targetDevice.status !== 'device';
+                  return (
+                    <button 
+                      className="large-btn primary" 
+                      disabled={!singleTargetId || !singleTargetText || actionInProgress || !!isOffline} 
+                      title={isOffline ? "Device is offline" : ""}
+                      style={{padding: '8px', fontSize: '14px', justifyContent: 'center'}} 
+                      onClick={() => executeSingleTarget(singleTargetId, singleTargetText)}
+                    >
+                      Send to this device only
+                    </button>
+                  );
+                })()}
+              </div>
+            )}
           </div>
 
         </div>
@@ -554,13 +740,45 @@ function App() {
       <main className="main-content">
         <div className="strip-header" style={{ padding: '16px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
-            <h2 style={{ margin: 0 }}>Live Grid ({activeDeviceCount} Active, {currentMaxSize}p@{currentVideoBitRate/1000}Kbps)</h2>
-            <div className="strip-stats" style={{ marginTop: '4px' }}>
-              <span><strong style={{color: 'var(--status-green)'}}>{activeDeviceCount}</strong> Online</span>
-              <span><strong style={{color: 'var(--status-red)'}}>{devices.filter(d => d.status === 'offline').length}</strong> Offline</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+              <div className="strip-stats" style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '18px', fontWeight: 'bold' }}>
+                  <CheckCircle2 size={20} color="var(--status-online)" />
+                  <span style={{color: 'var(--status-online)'}}>{activeDeviceCount}</span> <span style={{color: 'var(--text-main)', fontSize: '14px', fontWeight: 'normal'}}>Online</span>
+                </span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '18px', fontWeight: 'bold' }}>
+                  <MinusCircle size={20} color="var(--status-offline)" />
+                  <span style={{color: 'var(--status-offline)'}}>{devices.filter(d => d.status === 'offline').length}</span> <span style={{color: 'var(--text-main)', fontSize: '14px', fontWeight: 'normal'}}>Offline</span>
+                </span>
+              </div>
+              
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', paddingLeft: '16px', borderLeft: '1px solid var(--border)', color: 'var(--text-muted)' }}>
+                <span style={{ fontSize: '13px' }}>Last updated: {timeSinceUpdate}s ago</span>
+                <button className="icon-btn" onClick={() => window.electronAPI.getDevices().then(d => { setDevices(d); setLastUpdated(new Date()); })} title="Refresh List" style={{ padding: '4px' }}>
+                  <RefreshCw size={14} />
+                </button>
+              </div>
+              
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', paddingLeft: '16px', borderLeft: '1px solid var(--border)', fontSize: '13px' }}>
+                <span style={{ color: 'var(--text-muted)' }}>ADB Server:</span>
+                {adbConnected ? (
+                  <span style={{ color: 'var(--status-online)', display: 'flex', alignItems: 'center', gap: '4px', fontWeight: '500' }}>
+                    <CheckCircle2 size={14} /> Connected
+                  </span>
+                ) : (
+                  <span style={{ color: 'var(--status-error)', display: 'flex', alignItems: 'center', gap: '4px', fontWeight: '500' }}>
+                    <AlertTriangle size={14} /> Disconnected
+                  </span>
+                )}
+              </div>
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', fontSize: '14px', color: 'var(--text-muted)' }}>
+                <input type="checkbox" checked={showOffline} onChange={e => setShowOffline(e.target.checked)} /> Show Offline
+              </label>
+            </div>
             <div style={{ display: 'flex', border: '1px solid var(--border)', borderRadius: '4px', overflow: 'hidden' }}>
               <button 
                 className={gridDensity === 'compact' ? 'primary-btn' : 'secondary-btn'} 
@@ -608,10 +826,11 @@ function App() {
             const isSelected = selectedIds.has(device.id);
             const isDevice = device.status === 'device';
             
-            let statusColor = 'gray';
-            if (isDevice) statusColor = 'green';
-            else if (device.status === 'offline') statusColor = 'red';
-            else if (device.status === 'unauthorized') statusColor = 'yellow';
+            let statusColor = 'offline';
+            if (isDevice) statusColor = 'online';
+            else if (device.status === 'offline' || device.status === 'disconnect') statusColor = 'offline';
+            else if (device.status === 'unauthorized' || device.status === 'weak-connection') statusColor = 'warning';
+            else statusColor = 'error';
 
             const tileSizes = {
               compact: { w: 200, h: 380 },
@@ -632,71 +851,117 @@ function App() {
                   background: 'var(--bg-dark)'
                 }}
               >
-                <div style={{ position: 'absolute', top: 12, left: 12, zIndex: 20, cursor: 'pointer' }} onClick={(e) => toggleDeviceSelect(device.id, e)}>
-                  {isSelected ? <CheckSquare size={gridDensity === 'compact' ? 16 : 24} color="var(--accent)" /> : <Square size={gridDensity === 'compact' ? 16 : 24} color="white" />}
+                {/* 1. Fixed Header */}
+                <div style={{ padding: '8px 12px 8px 36px', borderBottom: '1px solid var(--border)', background: 'var(--card-bg)', position: 'relative' }}>
+                  <div style={{ position: 'absolute', top: 10, left: 8, zIndex: 20, cursor: 'pointer' }} onClick={(e) => toggleDeviceSelect(device.id, e)}>
+                    {isSelected ? <CheckSquare size={16} color="var(--accent)" /> : <Square size={16} color="white" />}
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
+                      <div style={{ color: `var(--status-${statusColor})`, display: 'flex' }}>
+                        {statusColor === 'online' && <CheckCircle2 size={14} />}
+                        {statusColor === 'warning' && <AlertTriangle size={14} />}
+                        {statusColor === 'error' && <XCircle size={14} />}
+                        {statusColor === 'offline' && <MinusCircle size={14} />}
+                      </div>
+                      <div style={{ fontSize: '13px', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {device.customName || device.name || device.model || 'Unknown'}
+                      </div>
+                    </div>
+                    {gridDensity !== 'compact' && (
+                      <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                        {device.serial ? device.serial.substring(0, 8) : ''}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
+                    {device.battery && (
+                      <span style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+                        {device.battery.level}% {device.battery.charging && <span style={{color: '#facc15'}}>⚡</span>}
+                      </span>
+                    )}
+                    {device.id.includes(':') && <Wifi size={10} />}
+                  </div>
                 </div>
 
+                {/* 2. Preview Area */}
                 <div className="thumb-img" style={{ flex: 1, position: 'relative', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                   {isDevice ? (
                     <LiveViewPoc 
+                      key={device.id + '-live'}
                       deviceId={device.id} 
                       maxSize={currentMaxSize}
                       videoBitRate={currentVideoBitRate}
-                      startDelayMs={index * 1500}
+                      startDelayMs={Math.min(index * 800, 4000)}
                       onMirrorTouch={(action, px, py) => handleMirrorTouch(device.id, action, px, py)}
                       onMirrorKeyCode={(keycode) => handleMirrorKeyCode(device.id, keycode)}
                       ref={el => { liveViewRefs.current[device.id] = el; }}
                     />
+                  ) : statusColor === 'warning' ? (
+                    <div style={{ textAlign: 'center', color: 'var(--status-warning)' }}>
+                      <RefreshCw size={gridDensity === 'compact' ? 24 : 48} opacity={0.5} style={{ margin: '0 auto 8px' }} className="spin" />
+                      {gridDensity !== 'compact' && (
+                        <>
+                          <div style={{ fontWeight: 'bold' }}>{device.status === 'weak-connection' ? '⚠️ Weak Connection' : 'Connecting...'}</div>
+                          {device.status === 'weak-connection' && (
+                            <button 
+                              className="primary-btn" 
+                              style={{ padding: '4px 8px', fontSize: '12px', marginTop: '8px' }}
+                              onClick={(e) => { e.stopPropagation(); window.electronAPI.retryDevice(device.id); }}
+                            >Retry</button>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  ) : statusColor === 'error' ? (
+                    <div style={{ textAlign: 'center', color: 'var(--status-error)' }}>
+                      <XCircle size={gridDensity === 'compact' ? 24 : 48} opacity={0.5} style={{ margin: '0 auto 8px' }} />
+                      {gridDensity !== 'compact' && (
+                        <>
+                          <div style={{ fontWeight: 'bold', fontSize: '12px', marginBottom: '8px' }}>Connection Failed</div>
+                          <button 
+                            className="primary-btn" 
+                            style={{ padding: '4px 8px', fontSize: '12px' }}
+                            onClick={(e) => { e.stopPropagation(); window.electronAPI.retryDevice(device.id); }}
+                          >Retry</button>
+                        </>
+                      )}
+                    </div>
                   ) : (
                     <div style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
                       <Smartphone size={gridDensity === 'compact' ? 24 : 48} opacity={0.5} style={{ margin: '0 auto 8px' }} />
-                      {gridDensity !== 'compact' && <div style={{ fontWeight: 'bold', color: `var(--status-${statusColor})` }}>{device.status.toUpperCase()}</div>}
+                      {gridDensity !== 'compact' && <div style={{ fontWeight: 'bold', color: `var(--status-${statusColor})`, textAlign: 'center', padding: '0 8px' }}>
+                        OFFLINE
+                      </div>}
                     </div>
                   )}
-                </div>
 
-                {gridDensity !== 'compact' && (
-                  <div className="thumb-footer" style={{ padding: gridDensity === 'normal' ? '8px' : '12px' }}>
-                    {gridDensity === 'large' && (
-                      <div className="thumb-name" style={{ fontSize: '14px', marginBottom: '8px' }}>
-                        {device.customName || device.name || device.model || 'Unknown'} ({device.id})
-                      </div>
-                    )}
-                    
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <div className="thumb-status" style={{ fontSize: '12px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                        <div className={`status-dot ${statusColor}`} />
-                        {gridDensity === 'normal' ? (device.customName || device.id) : device.status}
-                      </div>
-                      
-                      <div className={`thumb-actions ${gridDensity === 'normal' ? 'hover-only' : ''}`} style={{ display: 'flex', gap: '4px' }}>
-                        {isDevice && (
-                          <>
-                            <button className="icon-btn" style={{ padding: '4px' }} onClick={() => window.electronAPI.toggleScreen(device.id)} title="Toggle Screen Power">
-                              <Power size={14} />
-                            </button>
-                            <button className="icon-btn" style={{ padding: '4px' }} onClick={() => handleSwitchToWireless(device.id)} title="Switch to Wireless ADB" disabled={actionInProgress}>
-                              <Wifi size={14} />
-                            </button>
-                            <button className="icon-btn" style={{ padding: '4px' }} onClick={() => { setFocusedDeviceId(device.id); setShowAdbConsole(true); }} title="ADB Console">
-                              <Terminal size={14} />
-                            </button>
-                          </>
-                        )}
-                        <button className="icon-btn" style={{ padding: '4px' }} onClick={() => setHistoryDevice(device)}>
-                          <History size={14} />
-                        </button>
-                        <button className="icon-btn" style={{ padding: '4px' }} onClick={(e) => openSettings(device, e)}>
-                          <Settings size={14} />
-                        </button>
-                      </div>
-                    </div>
+                  {/* 3. Bottom Action Bar */}
+                  <div className={`thumb-actions-bar ${gridDensity === 'large' ? 'always-visible' : ''}`} style={{ display: 'flex', gap: '4px', padding: '8px', background: 'rgba(0,0,0,0.8)', position: 'absolute', bottom: 0, left: 0, right: 0, justifyContent: 'center', borderTop: '1px solid var(--border)' }}>
+                    <button className="icon-btn" style={{ padding: '4px' }} onClick={() => liveViewRefs.current[device.id]?.sendKeyCode(3)} title="Home" disabled={!isDevice}>
+                      <Home size={14} />
+                    </button>
+                    <button className="icon-btn" style={{ padding: '4px' }} onClick={() => liveViewRefs.current[device.id]?.sendKeyCode(4)} title="Back" disabled={!isDevice}>
+                      <ArrowLeft size={14} />
+                    </button>
+                    <button className="icon-btn" style={{ padding: '4px' }} onClick={(e) => openSettings(device, e)} title="Settings">
+                      <Settings size={14} />
+                    </button>
+                    <button className="icon-btn" style={{ padding: '4px' }} onClick={() => { setFocusedDeviceId(device.id); setShowAdbConsole(true); }} title="ADB Console" disabled={!isDevice}>
+                      <Terminal size={14} />
+                    </button>
+                    <button className="icon-btn" style={{ padding: '4px' }} onClick={() => setShowLogcatDeviceId(device.id)} title="Device Logs (Logcat)" disabled={!isDevice}>
+                      <FileText size={14} />
+                    </button>
+                    <button className="icon-btn" style={{ padding: '4px' }} onClick={() => setHistoryDevice(device)} title="History">
+                      <History size={14} />
+                    </button>
                   </div>
-                )}
+                </div>
               </div>
             );
           })}
-          {discoveredDevices.filter(dd => !devices.some(d => d.id === dd.ip || d.lastKnownIp === dd.ip.split(':')[0] || (dd.serial && (d.serial === dd.serial || d.id === dd.serial)))).map((dd, index) => {
+          {discoveredDevices.filter(dd => !devices.some(d => d.id === dd.ip || d.lastKnownIp === dd.ip.split(':')[0] || (dd.serial && (d.serial === dd.serial || d.id === dd.serial)))).map((dd) => {
             const currentSize = {
               compact: { w: 200, h: 380 },
               normal: { w: 280, h: 520 },
@@ -1048,6 +1313,13 @@ function App() {
             </div>
           </div>
         </div>
+      )}
+      
+      {showLogcatDeviceId && (
+        <LogcatViewer 
+          deviceId={showLogcatDeviceId} 
+          onClose={() => setShowLogcatDeviceId(null)} 
+        />
       )}
     </div>
   );

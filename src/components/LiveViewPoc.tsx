@@ -21,6 +21,7 @@ export const LiveViewPoc = React.forwardRef<LiveViewPocRef, {
   const wsRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<string>('Idle');
   const [reconnectCounter, setReconnectCounter] = useState<number>(0);
+  const pinchAnchorRef = useRef<{x: number, y: number} | null>(null);
 
   useEffect(() => {
     let isCancelled = false;
@@ -200,13 +201,29 @@ export const LiveViewPoc = React.forwardRef<LiveViewPocRef, {
     const pointerX = (videoX / renderedWidth) * videoWidth;
     const pointerY = (videoY / renderedHeight) * videoHeight;
 
+    if (e.altKey || e.ctrlKey || pinchAnchorRef.current) {
+      if (action === 0) { // down
+        pinchAnchorRef.current = { x: pointerX, y: pointerY };
+        wsRef.current.send(JSON.stringify({ type: 'touch', action: 0, x: pointerX, y: pointerY, videoWidth, videoHeight, pointerId: 1 }));
+        wsRef.current.send(JSON.stringify({ type: 'touch', action: 0, x: pointerX, y: pointerY, videoWidth, videoHeight, pointerId: 2 }));
+      } else if (action === 2 && pinchAnchorRef.current) { // move
+        wsRef.current.send(JSON.stringify({ type: 'touch', action: 2, x: pointerX, y: pointerY, videoWidth, videoHeight, pointerId: 2 }));
+      } else if (action === 1 && pinchAnchorRef.current) { // up
+        wsRef.current.send(JSON.stringify({ type: 'touch', action: 1, x: pointerX, y: pointerY, videoWidth, videoHeight, pointerId: 2 }));
+        wsRef.current.send(JSON.stringify({ type: 'touch', action: 1, x: pinchAnchorRef.current.x, y: pinchAnchorRef.current.y, videoWidth, videoHeight, pointerId: 1 }));
+        pinchAnchorRef.current = null;
+      }
+      return;
+    }
+
     const msg = {
       type: 'touch',
       action, // 0: down, 1: up, 2: move
       x: pointerX,
       y: pointerY,
       videoWidth,
-      videoHeight
+      videoHeight,
+      pointerId: 1
     };
     wsRef.current.send(JSON.stringify(msg));
 
