@@ -13,7 +13,7 @@ export default defineConfig({
           build: {
             outDir: 'dist-electron',
             rollupOptions: {
-              external: ['@devicefarmer/adbkit', 'stf-device-db']
+              external: ['@devicefarmer/adbkit', 'stf-device-db', 'better-sqlite3']
             }
           },
         },

@@ -208,13 +208,34 @@ function App() {
 
   useEffect(() => {
     window.electronAPI.getDevices().then(d => { setDevices(d); setLastUpdated(new Date()); });
-    window.electronAPI.onDevicesUpdated((updatedDevices) => {
-      setDevices(updatedDevices);
-      setLastUpdated(new Date());
-      // Extract all unique tags
-      const tags = new Set<string>();
-      updatedDevices.forEach(d => d.tags?.forEach(t => tags.add(t)));
-      setAllTags(Array.from(tags));
+    window.electronAPI.onDevicesUpdated((update) => {
+      setDevices(prevDevices => {
+        let nextDevices: DeviceData[];
+        if (Array.isArray(update)) {
+          nextDevices = update;
+        } else if (update && update.id) {
+          if (update.removed) {
+            nextDevices = prevDevices.filter(d => d.id !== update.id);
+          } else {
+            const idx = prevDevices.findIndex(d => d.id === update.id);
+            if (idx >= 0) {
+              nextDevices = [...prevDevices];
+              nextDevices[idx] = { ...nextDevices[idx], ...update.patch };
+            } else {
+              nextDevices = [...prevDevices, { id: update.id, ...update.patch } as DeviceData];
+            }
+          }
+        } else {
+          return prevDevices;
+        }
+
+        // Extract all unique tags
+        const tags = new Set<string>();
+        nextDevices.forEach(d => d.tags?.forEach(t => tags.add(t)));
+        setAllTags(Array.from(tags));
+        setLastUpdated(new Date());
+        return nextDevices;
+      });
     });
   }, []);
 

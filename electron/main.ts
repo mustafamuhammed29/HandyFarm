@@ -36,78 +36,77 @@ let mainWindow: BrowserWindow | null = null;
 const workers: Map<string, ChildProcess> = new Map();
 const workerGenerations: Map<string, number> = new Map();
 
-const dbPath = path.join(app.getPath('userData'), 'devices.json');
-let localDb: Record<string, any> = {};
-if (fs.existsSync(dbPath)) {
-  try {
-    localDb = JSON.parse(fs.readFileSync(dbPath, 'utf-8'));
-  } catch(e) {
-    console.error('Failed to read local DB', e);
+import { DeviceStore, thumbnailCache, downscaleThumbnail, type DeviceData } from './db.js';
+
+const sqliteDbPath = path.join(app.getPath('userData'), 'handyfarm.db');
+const legacyJsonPath = path.join(app.getPath('userData'), 'devices.json');
+const deviceStore = new DeviceStore(sqliteDbPath, legacyJsonPath);
+
+function broadcastDelta(deviceId: string, patch: Partial<DeviceData>, removed = false) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('devices-updated', {
+      id: deviceId,
+      patch,
+      removed
+    });
   }
 }
-    
-// Run dedupe once on startup to clean up any duplicates in the saved DB
-let didCleanup = false;
-const deviceIds = Object.keys(localDb);
-for (let i = 0; i < deviceIds.length; i++) {
-  const d1 = deviceIds[i];
-  if (!localDb[d1] || !localDb[d1].serial) continue;
-  for (let j = i + 1; j < deviceIds.length; j++) {
-    const d2 = deviceIds[j];
-    if (!localDb[d2] || !localDb[d2].serial) continue;
-    
-    if (localDb[d1].serial === localDb[d2].serial) {
-      // Conflict found in saved DB!
-      console.log(`[Startup Dedupe] Found duplicate serial ${localDb[d1].serial} for ${d1} and ${d2}`);
-      const d1IsWifi = d1.includes(':');
-      const d2IsWifi = d2.includes(':');
-      
-      const d1IsActive = localDb[d1].status === 'device';
-      const d2IsActive = localDb[d2].status === 'device';
+
+// Run dedupe once on startup to clean up any duplicates in the database
+const allInitialDevices = deviceStore.getAllDevices(false);
+for (let i = 0; i < allInitialDevices.length; i++) {
+  const d1 = allInitialDevices[i];
+  if (!d1 || !d1.serial) continue;
+  for (let j = i + 1; j < allInitialDevices.length; j++) {
+    const d2 = allInitialDevices[j];
+    if (!d2 || !d2.serial) continue;
+
+    if (d1.serial === d2.serial) {
+      console.log(`[Startup Dedupe] Found duplicate serial ${d1.serial} for ${d1.id} and ${d2.id}`);
+      const d1IsWifi = d1.id.includes(':');
+      const d2IsWifi = d2.id.includes(':');
+
+      const d1IsActive = d1.status === 'device';
+      const d2IsActive = d2.status === 'device';
 
       let toRemove = null;
-      if (d1IsActive && !d2IsActive) toRemove = d2;
-      else if (!d1IsActive && d2IsActive) toRemove = d1;
+      if (d1IsActive && !d2IsActive) toRemove = d2.id;
+      else if (!d1IsActive && d2IsActive) toRemove = d1.id;
       else {
         // Prefer USB: if one is WiFi and the other is USB, remove the WiFi one.
-        if (d1IsWifi && !d2IsWifi) toRemove = d1;
-        else if (!d1IsWifi && d2IsWifi) toRemove = d2;
-        else toRemove = d2; // remove the latter one if both same type
+        if (d1IsWifi && !d2IsWifi) toRemove = d1.id;
+        else if (!d1IsWifi && d2IsWifi) toRemove = d2.id;
+        else toRemove = d2.id;
       }
-      
+
       console.log(`[Startup Dedupe] Evicting stale entry ${toRemove}`);
-      delete localDb[toRemove];
-      didCleanup = true;
+      deviceStore.deleteDevice(toRemove);
     }
   }
 }
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const nowMs = Date.now();
-for (const id of Object.keys(localDb)) {
-  const lastConnected = localDb[id].connectedAt || 0;
+for (const dev of deviceStore.getAllDevices(false)) {
+  const lastConnected = dev.connectedAt || 0;
   if (nowMs - lastConnected > SEVEN_DAYS_MS) {
-    console.log(`[Startup Cleanup] Purging stale device ${id} (last seen ${new Date(lastConnected).toLocaleString()})`);
-    delete localDb[id];
-    didCleanup = true;
+    console.log(`[Startup Cleanup] Purging stale device ${dev.id} (last seen ${new Date(lastConnected).toLocaleString()})`);
+    deviceStore.deleteDevice(dev.id);
     continue;
   }
-  
-  if (localDb[id].status !== 'offline') {
-    localDb[id].status = 'offline';
-    didCleanup = true;
+
+  const patch: Partial<DeviceData> = {};
+  if (dev.status !== 'offline') {
+    patch.status = 'offline';
   }
-  if (!localDb[id].serial) {
-    localDb[id].serial = id;
-    didCleanup = true;
+  if (!dev.serial) {
+    patch.serial = dev.id;
+  }
+  if (Object.keys(patch).length > 0) {
+    deviceStore.updateDevice(dev.id, patch);
   }
 }
-
-if (didCleanup) saveDb();
-
-function saveDb() {
-  fs.writeFileSync(dbPath, JSON.stringify(localDb, null, 2));
-}
+deviceStore.flushWrites();
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -147,6 +146,14 @@ app.on('window-all-closed', function () {
   if (process.platform !== 'darwin') app.quit();
 });
 
+app.on('before-quit', () => {
+  deviceStore.flushWrites();
+});
+
+app.on('will-quit', () => {
+  deviceStore.close();
+});
+
 async function startAdbTracker() {
   try {
     const tracker = await client.trackDevices();
@@ -158,18 +165,19 @@ async function startAdbTracker() {
       console.log(`[Startup] Found ${existingDevices.length} already-connected device(s):`, existingDevices.map((d: any) => `${d.id}(${d.type})`).join(', '));
       for (const device of existingDevices) {
         console.log(`[Startup] Processing pre-connected device: ${device.id} (${device.type})`);
-        if (!localDb[device.id]) {
-          localDb[device.id] = { id: device.id, serial: device.id, status: device.type, connectedAt: Date.now() };
-        } else {
-          localDb[device.id].status = device.type;
-          if (!localDb[device.id].serial) localDb[device.id].serial = device.id;
-        }
+        const dev = deviceStore.getDevice(device.id);
+        const patch: Partial<DeviceData> = {
+          status: device.type,
+          serial: dev?.serial || device.id,
+          connectedAt: Date.now()
+        };
+        deviceStore.updateDevice(device.id, patch);
+        broadcastDelta(device.id, patch);
+
         if (device.type === 'device' || device.type === 'unauthorized') {
           queueWorker(device.id, device.type);
         }
       }
-      saveDb();
-      notifyUpdate();
     } catch (scanErr: any) {
       console.error('[Startup] listDevices() scan failed:', scanErr?.message || scanErr);
     }
@@ -177,15 +185,14 @@ async function startAdbTracker() {
 
     tracker.on('add', (device: any) => {
       console.log('Device added:', device.id, device.type);
-      if (!localDb[device.id]) {
-        localDb[device.id] = { id: device.id, serial: device.id, status: device.type, connectedAt: Date.now() };
-      } else {
-        localDb[device.id].status = device.type;
-        localDb[device.id].connectedAt = Date.now();
-        if (!localDb[device.id].serial) localDb[device.id].serial = device.id;
-      }
-      saveDb();
-      notifyUpdate();
+      const dev = deviceStore.getDevice(device.id);
+      const patch: Partial<DeviceData> = {
+        status: device.type,
+        connectedAt: Date.now(),
+        serial: dev?.serial || device.id
+      };
+      deviceStore.updateDevice(device.id, patch);
+      broadcastDelta(device.id, patch);
 
       if (device.type === 'device' || device.type === 'unauthorized') {
         queueWorker(device.id, device.type);
@@ -194,9 +201,9 @@ async function startAdbTracker() {
 
     tracker.on('remove', (device: any) => {
       console.log('Device removed:', device.id);
-      if (localDb[device.id]) {
-        localDb[device.id].status = 'offline';
-        saveDb();
+      if (deviceStore.hasDevice(device.id)) {
+        deviceStore.updateDevice(device.id, { status: 'offline' });
+        broadcastDelta(device.id, { status: 'offline' });
       }
 
       const worker = workers.get(device.id);
@@ -209,19 +216,17 @@ async function startAdbTracker() {
         if (qIdx >= 0) workerQueue.splice(qIdx, 1);
       }
       closeLiveView(device.id, 'Connection lost — device disconnected');
-      notifyUpdate();
     });
 
     tracker.on('change', (device: any) => {
       console.log('Device changed:', device.id, device.type);
-      if (!localDb[device.id]) {
-        localDb[device.id] = { id: device.id, serial: device.id, status: device.type, connectedAt: Date.now() };
-      } else {
-        localDb[device.id].status = device.type;
-        if (!localDb[device.id].serial) localDb[device.id].serial = device.id;
-      }
-      saveDb();
-      notifyUpdate();
+      const dev = deviceStore.getDevice(device.id);
+      const patch: Partial<DeviceData> = {
+        status: device.type,
+        serial: dev?.serial || device.id
+      };
+      deviceStore.updateDevice(device.id, patch);
+      broadcastDelta(device.id, patch);
 
       const worker = workers.get(device.id);
       if (worker && !worker.killed && worker.connected) {
@@ -233,12 +238,13 @@ async function startAdbTracker() {
 
     // Background Auto-Reconnect Loop for WiFi devices
     setInterval(async () => {
-      for (const deviceId in localDb) {
-        const dev = localDb[deviceId];
+      const allDevs = deviceStore.getAllDevices(false);
+      for (const dev of allDevs) {
+        const deviceId = dev.id;
         // If it's a USB device and it's offline and has a known IP
         if (!deviceId.includes(':') && (dev.status === 'offline' || dev.status === 'disconnect') && dev.lastKnownIp) {
           // Check if it's already actively connected via WiFi
-          const hasActiveWifi = Object.values(localDb).some(d => d.id.includes(':') && d.serial === dev.serial && d.status === 'device');
+          const hasActiveWifi = allDevs.some(d => d.id.includes(':') && d.serial === dev.serial && d.status === 'device');
           if (!hasActiveWifi) {
             console.log(`[Auto-Reconnect] Attempting to reconnect offline device ${deviceId} via last known IP ${dev.lastKnownIp}:5555`);
             try {
@@ -324,28 +330,51 @@ function spawnWorker(deviceId: string, status: string) {
       return;
     }
 
-    if (msg.type === 'DEVICE_DATA') {
-      localDb[deviceId] = { ...localDb[deviceId], ...msg.data, id: deviceId };
-      if (!localDb[deviceId].serial) {
-        localDb[deviceId].serial = deviceId;
+    if (msg.type === 'SCREENSHOT_FRAME' && msg.buffer) {
+      const rawBuf = Buffer.isBuffer(msg.buffer) ? msg.buffer : Buffer.from(msg.buffer.data || msg.buffer);
+      const downscaled = downscaleThumbnail(rawBuf);
+      if (downscaled) {
+        thumbnailCache.set(deviceId, downscaled);
+        broadcastDelta(deviceId, { thumbnail: downscaled });
       }
-      
-      if (msg.data.serial) {
-        for (const otherId in localDb) {
-          const otherSerial = localDb[otherId].serial;
-          if (otherId !== deviceId && otherSerial === msg.data.serial) {
-            console.log(`[Dedupe check] Conflict found between ${deviceId} and ${otherId} (serial: ${msg.data.serial})`);
-            
+      return;
+    }
+
+    if (msg.type === 'DEVICE_DATA') {
+      const patch = { ...msg.data };
+      if (patch.thumbnail) {
+        const thumb = patch.thumbnail;
+        delete patch.thumbnail;
+        if (typeof thumb === 'string' && thumb.startsWith('data:image/')) {
+          const b64 = thumb.split(',')[1];
+          if (b64) {
+            const downscaled = downscaleThumbnail(Buffer.from(b64, 'base64'));
+            if (downscaled) {
+              thumbnailCache.set(deviceId, downscaled);
+              broadcastDelta(deviceId, { thumbnail: downscaled });
+            }
+          }
+        }
+      }
+
+      deviceStore.updateDevice(deviceId, patch);
+
+      if (patch.serial) {
+        const allDevs = deviceStore.getAllDevices(false);
+        for (const other of allDevs) {
+          if (other.id !== deviceId && other.serial === patch.serial) {
+            console.log(`[Dedupe check] Conflict found between ${deviceId} and ${other.id} (serial: ${patch.serial})`);
+
             // Only conflict if they are both trying to be active, or prefer the active one
             const isCurrentWifi = deviceId.includes(':');
-            const isOtherWifi = otherId.includes(':');
-            
-            const isCurrentActive = msg.data.status === 'device';
-            const isOtherActive = localDb[otherId].status === 'device';
+            const isOtherWifi = other.id.includes(':');
+
+            const isCurrentActive = patch.status === 'device';
+            const isOtherActive = other.status === 'device';
 
             let idToKill = null;
             if (isCurrentActive && !isOtherActive) {
-              idToKill = otherId;
+              idToKill = other.id;
             } else if (!isCurrentActive && isOtherActive) {
               idToKill = deviceId;
             } else {
@@ -353,12 +382,12 @@ function spawnWorker(deviceId: string, status: string) {
               if (isCurrentWifi && !isOtherWifi) {
                 idToKill = deviceId; // kill the current WiFi if other is USB
               } else if (!isCurrentWifi && isOtherWifi) {
-                idToKill = otherId; // kill the other WiFi if current is USB
+                idToKill = other.id; // kill the other WiFi if current is USB
               } else {
-                idToKill = otherId;
+                idToKill = other.id;
               }
             }
-            
+
             if (idToKill) {
               console.log(`[Dedupe] MATCH! Evicting stale/duplicate device ${idToKill} to enforce one tile per physical device`);
               const oldWorker = workers.get(idToKill);
@@ -368,12 +397,10 @@ function spawnWorker(deviceId: string, status: string) {
                 workers.delete(idToKill);
               }
               closeLiveView(idToKill, 'Connection lost — evicted by dedupe logic');
-              delete localDb[idToKill];
+              deviceStore.deleteDevice(idToKill);
+              broadcastDelta(idToKill, {}, true);
 
               if (idToKill === deviceId) {
-                // The current worker was killed (it was the USB one, and WiFi already exists)
-                saveDb();
-                notifyUpdate();
                 return; // Stop processing this worker's message
               }
             }
@@ -381,14 +408,13 @@ function spawnWorker(deviceId: string, status: string) {
         }
       }
 
-      saveDb();
-      notifyUpdate();
+      broadcastDelta(deviceId, patch);
     }
   });
 
   worker.on('exit', (code) => {
     console.log(`Worker for ${deviceId} (gen ${currentGen}) exited with code ${code}`);
-    
+
     // Ignore stale exit handlers if generation moved on or worker replaced
     if (workerGenerations.get(deviceId) !== currentGen || workers.get(deviceId) !== worker) {
       console.log(`[Worker Exit] Ignoring stale exit event for ${deviceId} (gen ${currentGen} vs current ${workerGenerations.get(deviceId)})`);
@@ -398,11 +424,12 @@ function spawnWorker(deviceId: string, status: string) {
     workers.delete(deviceId);
     checkQueue();
     broadcastScreencapInterval();
-    
+
     // Auto-restart if we think it should still be connected (status is not offline in our DB)
-    if (localDb[deviceId] && localDb[deviceId].status !== 'offline' && localDb[deviceId].status !== 'disconnect') {
-        console.log(`Re-queuing worker for ${deviceId}`);
-        setTimeout(() => queueWorker(deviceId, localDb[deviceId].status), 2000);
+    const dev = deviceStore.getDevice(deviceId);
+    if (dev && dev.status !== 'offline' && dev.status !== 'disconnect') {
+      console.log(`Re-queuing worker for ${deviceId}`);
+      setTimeout(() => queueWorker(deviceId, dev.status), 2000);
     }
   });
 
@@ -410,15 +437,8 @@ function spawnWorker(deviceId: string, status: string) {
   broadcastScreencapInterval();
 }
 
-function notifyUpdate() {
-  if (mainWindow) {
-    const devices = Object.values(localDb);
-    mainWindow.webContents.send('devices-updated', devices);
-  }
-}
-
 ipcMain.handle('get-devices', () => {
-  return Object.values(localDb);
+  return deviceStore.getAllDevices(true);
 });
 
 ipcMain.handle('retry-device', (_event, deviceId: string) => {
@@ -438,18 +458,16 @@ ipcMain.handle('retry-device', (_event, deviceId: string) => {
   const qIdx = workerQueue.findIndex(w => w.deviceId === deviceId);
   if (qIdx >= 0) workerQueue.splice(qIdx, 1);
 
-
   // Re-query adb for current device status
   client.listDevices().then((devices: any[]) => {
     const found = devices.find((d: any) => d.id === deviceId);
     const liveStatus = found ? found.type : 'offline';
     console.log(`[Retry] ADB reports ${deviceId} as: ${liveStatus}`);
 
-    if (localDb[deviceId]) {
-      localDb[deviceId].status = liveStatus;
-      if (!localDb[deviceId].serial) localDb[deviceId].serial = deviceId;
-      saveDb();
-      notifyUpdate();
+    const dev = deviceStore.getDevice(deviceId);
+    if (dev) {
+      deviceStore.updateDevice(deviceId, { status: liveStatus, serial: dev.serial || deviceId });
+      broadcastDelta(deviceId, { status: liveStatus });
     }
 
     if (liveStatus === 'device') {
@@ -493,7 +511,7 @@ ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, vi
   console.log(`[POC] Starting Live View for ${deviceId}`);
   
   // Phase 4: DeviceId validation
-  const connected = localDb[deviceId];
+  const connected = deviceStore.getDevice(deviceId);
   if (!connected || connected.status !== 'device') {
     return { success: false, error: 'Device is not connected or unauthorized' };
   }
@@ -765,12 +783,11 @@ ipcMain.handle('stop-live-view-poc', async (_event, deviceId) => {
 });
 
 function logAction(deviceId: string, action: string) {
-  if (!localDb[deviceId]) localDb[deviceId] = { id: deviceId };
-  if (!localDb[deviceId].history) localDb[deviceId].history = [];
-  localDb[deviceId].history.unshift({ action, timestamp: new Date().toISOString() });
-  localDb[deviceId].history = localDb[deviceId].history.slice(0, 50); // keep last 50
-  saveDb();
-  notifyUpdate();
+  deviceStore.logDeviceAction(deviceId, action);
+  const dev = deviceStore.getDevice(deviceId);
+  if (dev) {
+    broadcastDelta(deviceId, { history: dev.history });
+  }
 }
 
 function isValidPackageName(pkg: string): boolean {
@@ -854,12 +871,8 @@ ipcMain.handle('install-apk', async (_event, deviceId, apkPath) => {
 });
 
 ipcMain.handle('update-device-data', (_event, deviceId, data) => {
-  if (!localDb[deviceId]) {
-    localDb[deviceId] = { id: deviceId };
-  }
-  localDb[deviceId] = { ...localDb[deviceId], ...data };
-  saveDb();
-  notifyUpdate();
+  deviceStore.updateDevice(deviceId, data);
+  broadcastDelta(deviceId, data);
   return true;
 });
 
@@ -872,7 +885,12 @@ ipcMain.handle('export-config', async () => {
   });
   if (canceled || !filePath) return { success: false };
   try {
-    fs.writeFileSync(filePath, JSON.stringify(localDb, null, 2));
+    const devicesList = deviceStore.getAllDevices(false);
+    const exportMap: Record<string, DeviceData> = {};
+    for (const d of devicesList) {
+      exportMap[d.id] = d;
+    }
+    fs.writeFileSync(filePath, JSON.stringify(exportMap, null, 2));
     return { success: true, path: filePath };
   } catch (e: any) {
     return { success: false, error: e.message };
@@ -888,10 +906,12 @@ ipcMain.handle('import-config', async () => {
   });
   if (canceled || filePaths.length === 0) return { success: false };
   try {
-    const data = JSON.parse(fs.readFileSync(filePaths[0], 'utf-8'));
-    localDb = { ...localDb, ...data };
-    saveDb();
-    notifyUpdate();
+    const data: Record<string, Partial<DeviceData>> = JSON.parse(fs.readFileSync(filePaths[0], 'utf-8'));
+    for (const [id, patch] of Object.entries(data)) {
+      deviceStore.updateDevice(id, patch);
+      broadcastDelta(id, patch);
+    }
+    deviceStore.flushWrites();
     return { success: true };
   } catch (e: any) {
     return { success: false, error: e.message };
@@ -932,6 +952,7 @@ ipcMain.handle('take-screenshot', async (_event, deviceId) => {
   }
 });
 
+// TODO(clipper-security-debt): bringClipperToFocus() visibly steals screen focus during every clipboard read on Android 10+ (API 29+). This is accepted as a temporary tradeoff.
 async function bringClipperToFocus(deviceId: string) {
   await execAsync(`adb -s ${deviceId} shell am start -W -n ca.zgrs.clipper/.Main`).catch(() => {});
   await new Promise(r => setTimeout(r, 350));
@@ -950,7 +971,9 @@ async function ensureClipperInstalled(deviceId: string) {
     const out = (await Adb.util.readAll(stream)).toString();
     if (!out.includes('package:')) {
       console.log(`[Clipper] Installing clipper.apk on ${deviceId} from ${clipperPath}...`);
+      // TODO(clipper-security-debt): clipper.apk (majido/clipper, ca.zgrs.clipper) requires package_verifier_enable=0 and verifier_verify_adb_installs=0 to install (disabling Play Protect verification system-wide on the device, not just for this app). This is accepted as a temporary tradeoff.
       await execAsync(`adb -s ${deviceId} shell settings put global verifier_verify_adb_installs 0`).catch(() => {});
+      await execAsync(`adb -s ${deviceId} shell settings put global package_verifier_enable 0`).catch(() => {});
       try {
         await execAsync(`adb -s ${deviceId} install -r -d -g --bypass-low-target-sdk-block "${clipperPath}"`);
       } catch {
@@ -1043,11 +1066,9 @@ ipcMain.handle('switch-to-wireless', async (_event, deviceId) => {
       try { active.ws.close(); active.client.close(); } catch(e) {}
       activeLiveViews.delete(oldId);
     }
-    if (localDb[oldId]) {
-      localDb[oldId].lastKnownIp = ip; // Save last known IP for auto-reconnect
-      localDb[oldId].status = 'offline'; // Temporarily mark offline so WiFi takes over
-      saveDb();
-      notifyUpdate();
+    if (deviceStore.hasDevice(oldId)) {
+      deviceStore.updateDevice(oldId, { lastKnownIp: ip, status: 'offline' });
+      broadcastDelta(oldId, { lastKnownIp: ip, status: 'offline' });
     }
 
     logAction(deviceId, `Switched to Wireless ADB (${ip}:5555)`);

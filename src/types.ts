@@ -29,6 +29,12 @@ export interface TestAccount {
   password?: string;
 }
 
+export interface DeviceDelta {
+  id: string;
+  patch?: Partial<DeviceData>;
+  removed?: boolean;
+}
+
 declare global {
   interface Window {
     electronAPI: {
@@ -38,7 +44,7 @@ declare global {
       openLink: (deviceId: string, url: string) => Promise<{success: boolean, error?: string}>;
       installApk: (deviceId: string, apkPath: string) => Promise<{success: boolean, error?: string}>;
       updateDeviceData: (deviceId: string, data: Partial<DeviceData>) => Promise<boolean>;
-      onDevicesUpdated: (callback: (devices: DeviceData[]) => void) => void;
+      onDevicesUpdated: (callback: (update: DeviceData[] | DeviceDelta) => void) => void;
       switchToWireless: (deviceId: string) => Promise<{success: boolean, ip?: string, error?: string}>;
       // Phase 7 Actions
       exportConfig: () => Promise<{success: boolean, path?: string, error?: string}>;

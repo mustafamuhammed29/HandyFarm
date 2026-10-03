@@ -117,8 +117,8 @@ async function takeScreenshot() {
     stream.on('end', () => {
       const buffer = Buffer.concat(chunks);
       process.send?.({
-        type: 'DEVICE_DATA',
-        data: { thumbnail: 'data:image/png;base64,' + buffer.toString('base64') }
+        type: 'SCREENSHOT_FRAME',
+        buffer
       });
     });
   } catch (e) {
