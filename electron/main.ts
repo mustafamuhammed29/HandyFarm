@@ -932,6 +932,16 @@ ipcMain.handle('take-screenshot', async (_event, deviceId) => {
   }
 });
 
+async function bringClipperToFocus(deviceId: string) {
+  await execAsync(`adb -s ${deviceId} shell am start -W -n ca.zgrs.clipper/.Main`).catch(() => {});
+  await new Promise(r => setTimeout(r, 350));
+  const { stdout } = await execAsync(`adb -s ${deviceId} shell dumpsys window`).catch(() => ({ stdout: '' }));
+  if (stdout.includes('DeprecatedTargetSdkVersionDialog')) {
+    await execAsync(`adb -s ${deviceId} shell input keyevent 4`).catch(() => {});
+    await new Promise(r => setTimeout(r, 250));
+  }
+}
+
 async function ensureClipperInstalled(deviceId: string) {
   const clipperPath = getResourcePath('clipper.apk');
   if (!fs.existsSync(clipperPath)) return;
@@ -940,8 +950,15 @@ async function ensureClipperInstalled(deviceId: string) {
     const out = (await Adb.util.readAll(stream)).toString();
     if (!out.includes('package:')) {
       console.log(`[Clipper] Installing clipper.apk on ${deviceId} from ${clipperPath}...`);
-      await client.getDevice(deviceId).install(clipperPath);
-      await client.getDevice(deviceId).shell('am startservice ca.zgrs.clipper/.ClipboardService');
+      await execAsync(`adb -s ${deviceId} shell settings put global verifier_verify_adb_installs 0`).catch(() => {});
+      try {
+        await execAsync(`adb -s ${deviceId} install -r -d -g --bypass-low-target-sdk-block "${clipperPath}"`);
+      } catch {
+        await client.getDevice(deviceId).install(clipperPath);
+      }
+      // Launch once to move package out of stopped state, then dismiss
+      await bringClipperToFocus(deviceId);
+      await execAsync(`adb -s ${deviceId} shell input keyevent 4`).catch(() => {});
     }
   } catch (err: any) {
     console.warn(`[Clipper] Auto-install check failed for ${deviceId}:`, err?.message || err);
@@ -953,21 +970,28 @@ ipcMain.handle('sync-clipboard', async (_event, deviceId, direction, text) => {
     await ensureClipperInstalled(deviceId);
     if (direction === 'toDevice') {
       const sanitized = sanitizeFreeText(text || '');
-      await client.getDevice(deviceId).shell(`am broadcast -a clipper.set -e text "${sanitized}"`);
+      await client.getDevice(deviceId).shell(`am broadcast -a clipper.set -n ca.zgrs.clipper/.ClipperReceiver -e text "${sanitized}"`);
       logAction(deviceId, 'Synced clipboard to device');
       return { success: true };
     } else if (direction === 'fromDevice') {
       console.log(`[IPC] sync-clipboard called fromDevice for ${deviceId}`);
-      const stream = await client.getDevice(deviceId).shell('am broadcast -a clipper.get');
+      // On Android 10+ (API 29+), reading clipboard requires the helper app to have foreground focus
+      await bringClipperToFocus(deviceId);
+
+      const stream = await client.getDevice(deviceId).shell('am broadcast -a clipper.get -n ca.zgrs.clipper/.ClipperReceiver');
       const buffer = await Adb.util.readAll(stream);
       const output = buffer.toString();
+
+      // Send KEYCODE_BACK to return to the previous screen
+      await client.getDevice(deviceId).shell('input keyevent 4').catch(() => {});
+
       console.log(`[IPC] Broadcast output:`, output);
       const match = output.match(/data="(.*)"/s);
-      if (match) {
+      if (match && match[1] !== undefined) {
         console.log(`[IPC] Regex match found, clipText:`, match[1]);
         clipboard.writeText(match[1]);
         logAction(deviceId, 'Synced clipboard from device');
-        return { success: true };
+        return { success: true, text: match[1] };
       } else {
         console.log(`[IPC] Regex match FAILED.`);
         return { success: false, error: 'Could not read clipboard. Helper APK might be missing or clipboard is empty.' };
