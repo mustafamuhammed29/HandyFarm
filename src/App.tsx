@@ -919,13 +919,52 @@ function App() {
                       </div>
                     )}
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                    {device.battery && (
-                      <span style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
-                        {device.battery.level}% {device.battery.charging && <span style={{color: '#facc15'}}>⚡</span>}
-                      </span>
-                    )}
-                    {device.id.includes(':') && <Wifi size={10} />}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      {device.battery && (
+                        <span style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+                          {device.battery.level}% {device.battery.charging && <span style={{color: '#facc15'}}>⚡</span>}
+                        </span>
+                      )}
+                      {device.id.includes(':') && <Wifi size={10} />}
+                    </div>
+
+                    {/* Phase 5: Lease State Badge */}
+                    {(() => {
+                      const state = device.leaseState || 'available';
+                      let label = 'Available';
+                      let title = 'Device is available for lease';
+                      if (state === 'leased') {
+                        const now = Date.now();
+                        const remSec = device.leaseExpiresAt ? Math.max(0, Math.ceil((device.leaseExpiresAt - now) / 1000)) : 0;
+                        const remMin = Math.floor(remSec / 60);
+                        const remStr = remMin > 0 ? `${remMin}m` : `${remSec}s`;
+                        label = `${device.leasedBy || 'Leased'} (${remStr})`;
+                        title = `Leased by ${device.leasedBy || 'session'} until ${device.leaseExpiresAt ? new Date(device.leaseExpiresAt).toLocaleTimeString() : 'expiry'}`;
+                      } else if (state === 'cooling_down') {
+                        const now = Date.now();
+                        const remSec = device.leaseExpiresAt ? Math.max(0, Math.ceil((device.leaseExpiresAt - now) / 1000)) : 5;
+                        label = `Cooling (${remSec}s)`;
+                        title = 'Device is cooling down after lease release';
+                      } else if (state === 'quarantined') {
+                        label = 'Quarantined';
+                        title = 'Device is quarantined';
+                      } else if (state === 'maintenance') {
+                        label = 'Maintenance';
+                        title = 'Device is undergoing maintenance';
+                      }
+
+                      return (
+                        <span className={`lease-badge ${state}`} title={title}>
+                          {state === 'available' && '● '}
+                          {state === 'leased' && '🔒 '}
+                          {state === 'cooling_down' && '⏳ '}
+                          {state === 'quarantined' && '⚠️ '}
+                          {state === 'maintenance' && '🔧 '}
+                          {label}
+                        </span>
+                      );
+                    })()}
                   </div>
                 </div>
 
@@ -1217,6 +1256,147 @@ function App() {
                 </button>
               </div>
             )}
+
+            {/* Phase 5: Lease Management */}
+            <div className="form-group" style={{borderTop: '1px solid var(--border)', paddingTop: '16px'}}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                <label style={{ margin: 0, fontWeight: 600 }}>Lease Status & Allocation</label>
+                <span className={`lease-badge ${settingsDevice.leaseState || 'available'}`}>
+                  {settingsDevice.leaseState || 'available'}
+                </span>
+              </div>
+              <div style={{ background: 'var(--bg-color)', padding: '10px', borderRadius: '8px', fontSize: '12px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                <div><strong>Physical ID:</strong> <span style={{ fontFamily: 'monospace' }}>{settingsDevice.physicalDeviceId || settingsDevice.serial || settingsDevice.id}</span></div>
+                {settingsDevice.leaseState === 'leased' && (
+                  <>
+                    <div><strong>Leased By:</strong> {settingsDevice.leasedBy || 'unknown'}</div>
+                    <div><strong>Expires At:</strong> {settingsDevice.leaseExpiresAt ? new Date(settingsDevice.leaseExpiresAt).toLocaleTimeString() : 'N/A'}</div>
+                    {settingsDevice.lastHeartbeatAt && (
+                      <div><strong>Last Heartbeat:</strong> {new Date(settingsDevice.lastHeartbeatAt).toLocaleTimeString()}</div>
+                    )}
+                  </>
+                )}
+                {settingsDevice.leaseState === 'cooling_down' && (
+                  <div><strong>Cooling down until:</strong> {settingsDevice.leaseExpiresAt ? new Date(settingsDevice.leaseExpiresAt).toLocaleTimeString() : 'N/A'}</div>
+                )}
+              </div>
+
+              <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap' }}>
+                {(!settingsDevice.leaseState || settingsDevice.leaseState === 'available') && (
+                  <>
+                    <input 
+                      type="text" 
+                      id="leaseSessionInput" 
+                      placeholder="Session ID (e.g. operator-1)" 
+                      defaultValue="operator-ui"
+                      style={{ flex: 1, minWidth: '130px', padding: '6px' }}
+                    />
+                    <select id="leaseTtlSelect" defaultValue="15" style={{ padding: '6px', background: 'var(--bg-dark)', color: 'white', borderRadius: '6px', border: '1px solid var(--border)' }}>
+                      <option value="1">1 min</option>
+                      <option value="5">5 min</option>
+                      <option value="15">15 min</option>
+                      <option value="60">60 min</option>
+                    </select>
+                    <button 
+                      className="primary-btn" 
+                      style={{ padding: '6px 12px', fontSize: '12px' }}
+                      onClick={async () => {
+                        const sid = (document.getElementById('leaseSessionInput') as HTMLInputElement)?.value || 'operator-ui';
+                        const ttl = parseInt((document.getElementById('leaseTtlSelect') as HTMLSelectElement)?.value || '15', 10);
+                        const physId = settingsDevice.physicalDeviceId || settingsDevice.serial || settingsDevice.id;
+                        const res = await window.electronAPI.acquireLease?.(physId, sid, ttl);
+                        if (res?.success) {
+                          setGlobalMessage(`Lease acquired for ${physId}`);
+                          setSettingsDevice({
+                            ...settingsDevice,
+                            leaseState: 'leased',
+                            leasedBy: sid,
+                            leaseExpiresAt: res.lease?.leaseExpiresAt
+                          });
+                        } else {
+                          alert(`Failed to acquire lease: ${res?.error}`);
+                        }
+                      }}
+                    >
+                      Acquire Lease
+                    </button>
+                  </>
+                )}
+
+                {settingsDevice.leaseState === 'leased' && (
+                  <>
+                    <button 
+                      className="secondary-btn" 
+                      style={{ padding: '6px 12px', fontSize: '12px', color: '#f59e0b' }}
+                      onClick={async () => {
+                        const physId = settingsDevice.physicalDeviceId || settingsDevice.serial || settingsDevice.id;
+                        const sid = settingsDevice.leasedBy || '';
+                        const res = await window.electronAPI.heartbeatLease?.(physId, sid, 5);
+                        if (res?.success) {
+                          setGlobalMessage('Lease renewed (+5 min)');
+                          setSettingsDevice({
+                            ...settingsDevice,
+                            leaseExpiresAt: res.leaseExpiresAt
+                          });
+                        } else {
+                          alert(`Heartbeat failed: ${res?.error}`);
+                        }
+                      }}
+                    >
+                      Extend (+5m)
+                    </button>
+                    <button 
+                      className="secondary-btn" 
+                      style={{ padding: '6px 12px', fontSize: '12px', color: '#ef4444' }}
+                      onClick={async () => {
+                        const physId = settingsDevice.physicalDeviceId || settingsDevice.serial || settingsDevice.id;
+                        const sid = settingsDevice.leasedBy || '';
+                        const res = await window.electronAPI.releaseLease?.(physId, sid);
+                        if (res?.success) {
+                          setGlobalMessage('Lease released (cooling down 5s)');
+                          setSettingsDevice({
+                            ...settingsDevice,
+                            leaseState: 'cooling_down'
+                          });
+                        } else {
+                          alert(`Failed to release lease: ${res?.error}`);
+                        }
+                      }}
+                    >
+                      Release Lease
+                    </button>
+                  </>
+                )}
+
+                <div style={{ display: 'flex', gap: '6px', width: '100%', marginTop: '6px', alignItems: 'center' }}>
+                  <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Override state:</span>
+                  <button 
+                    style={{ fontSize: '10px', padding: '2px 6px', background: 'transparent', border: '1px solid var(--border)', borderRadius: '4px', cursor: 'pointer', color: 'var(--text-muted)' }}
+                    onClick={async () => {
+                      const physId = settingsDevice.physicalDeviceId || settingsDevice.serial || settingsDevice.id;
+                      await window.electronAPI.setDeviceLeaseState?.(physId, 'available');
+                      setSettingsDevice({ ...settingsDevice, leaseState: 'available', leasedBy: undefined, leaseExpiresAt: undefined });
+                    }}
+                  >Force Available</button>
+                  <button 
+                    style={{ fontSize: '10px', padding: '2px 6px', background: 'transparent', border: '1px solid var(--border)', borderRadius: '4px', cursor: 'pointer', color: 'var(--text-muted)' }}
+                    onClick={async () => {
+                      const physId = settingsDevice.physicalDeviceId || settingsDevice.serial || settingsDevice.id;
+                      await window.electronAPI.setDeviceLeaseState?.(physId, 'quarantined');
+                      setSettingsDevice({ ...settingsDevice, leaseState: 'quarantined' });
+                    }}
+                  >Quarantine</button>
+                  <button 
+                    style={{ fontSize: '10px', padding: '2px 6px', background: 'transparent', border: '1px solid var(--border)', borderRadius: '4px', cursor: 'pointer', color: 'var(--text-muted)' }}
+                    onClick={async () => {
+                      const physId = settingsDevice.physicalDeviceId || settingsDevice.serial || settingsDevice.id;
+                      await window.electronAPI.setDeviceLeaseState?.(physId, 'maintenance');
+                      setSettingsDevice({ ...settingsDevice, leaseState: 'maintenance' });
+                    }}
+                  >Maintenance</button>
+                </div>
+              </div>
+            </div>
 
             <div className="modal-actions" style={{borderTop: '1px solid var(--border)', paddingTop: '16px'}}>
               <button onClick={() => setSettingsDevice(null)}>Cancel</button>

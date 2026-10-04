@@ -3,6 +3,17 @@ import { nativeImage } from 'electron';
 import fs from 'fs';
 import path from 'path';
 
+export type LeaseState = 'available' | 'leased' | 'cooling_down' | 'quarantined' | 'maintenance';
+
+export interface DeviceLeaseInfo {
+  physicalDeviceId: string;
+  state: LeaseState;
+  leasedBy?: string;
+  leaseExpiresAt?: number;
+  lastHeartbeatAt?: number;
+  updatedAt: number;
+}
+
 export interface DeviceData {
   id: string;
   physicalDeviceId?: string;
@@ -20,6 +31,10 @@ export interface DeviceData {
   connectedAt?: number;
   lastKnownIp?: string;
   battery?: { level: number; charging: boolean };
+  leaseState?: LeaseState;
+  leasedBy?: string;
+  leaseExpiresAt?: number;
+  lastHeartbeatAt?: number;
 }
 
 import type { PhysicalDeviceMapping, DeviceHardwareProps } from './identity.js';
@@ -98,6 +113,7 @@ export class DeviceStore {
   private debounceTimer: NodeJS.Timeout | null = null;
   private inMemoryDevices = new Map<string, DeviceData>();
   private physicalMappings = new Map<string, PhysicalDeviceMapping>();
+  private leases = new Map<string, DeviceLeaseInfo>();
 
   private stmtUpsertDevice!: Database.Statement;
   private stmtDeleteDevice!: Database.Statement;
@@ -108,6 +124,9 @@ export class DeviceStore {
   private stmtReparentHistory!: Database.Statement;
   private stmtUpsertPhysicalMapping!: Database.Statement;
   private stmtGetAllPhysicalMappings!: Database.Statement;
+  private stmtUpsertLease!: Database.Statement;
+  private stmtGetLease!: Database.Statement;
+  private stmtGetAllLeases!: Database.Statement;
 
   constructor(dbPath: string, jsonBackupPath?: string) {
     const dir = path.dirname(dbPath);
@@ -150,6 +169,10 @@ export class DeviceStore {
         last_known_ip TEXT,
         battery_level INTEGER,
         battery_charging INTEGER,
+        lease_state TEXT DEFAULT 'available',
+        leased_by TEXT,
+        lease_expires_at INTEGER,
+        last_heartbeat_at INTEGER,
         updated_at INTEGER NOT NULL
       );
 
@@ -174,6 +197,16 @@ export class DeviceStore {
         serials TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS leases (
+        physical_device_id TEXT PRIMARY KEY,
+        lease_state TEXT NOT NULL DEFAULT 'available',
+        leased_by TEXT,
+        lease_expires_at INTEGER,
+        last_heartbeat_at INTEGER,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_leases_state ON leases(lease_state);
     `);
 
     // Ensure physical_device_id column exists if table was created in an earlier migration
@@ -182,16 +215,32 @@ export class DeviceStore {
       this.db.exec('ALTER TABLE devices ADD COLUMN physical_device_id TEXT;');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_devices_physical_id ON devices(physical_device_id);');
     }
+    if (!cols.some(c => c.name === 'lease_state')) {
+      this.db.exec("ALTER TABLE devices ADD COLUMN lease_state TEXT DEFAULT 'available';");
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_devices_lease_state ON devices(lease_state);');
+    }
+    if (!cols.some(c => c.name === 'leased_by')) {
+      this.db.exec('ALTER TABLE devices ADD COLUMN leased_by TEXT;');
+    }
+    if (!cols.some(c => c.name === 'lease_expires_at')) {
+      this.db.exec('ALTER TABLE devices ADD COLUMN lease_expires_at INTEGER;');
+    }
+    if (!cols.some(c => c.name === 'last_heartbeat_at')) {
+      this.db.exec('ALTER TABLE devices ADD COLUMN last_heartbeat_at INTEGER;');
+    }
+    this.db.exec("UPDATE devices SET lease_state = 'available' WHERE lease_state IS NULL OR lease_state = '';");
   }
 
   private prepareStatements() {
     this.stmtUpsertDevice = this.db.prepare(`
       INSERT INTO devices (
         id, physical_device_id, serial, status, model, manufacturer, name, custom_name, notes,
-        is_bare_board, tags, connected_at, last_known_ip, battery_level, battery_charging, updated_at
+        is_bare_board, tags, connected_at, last_known_ip, battery_level, battery_charging,
+        lease_state, leased_by, lease_expires_at, last_heartbeat_at, updated_at
       ) VALUES (
         @id, @physicalDeviceId, @serial, @status, @model, @manufacturer, @name, @customName, @notes,
-        @isBareBoard, @tags, @connectedAt, @lastKnownIp, @batteryLevel, @batteryCharging, @updatedAt
+        @isBareBoard, @tags, @connectedAt, @lastKnownIp, @batteryLevel, @batteryCharging,
+        @leaseState, @leasedBy, @leaseExpiresAt, @lastHeartbeatAt, @updatedAt
       )
       ON CONFLICT(id) DO UPDATE SET
         physical_device_id = COALESCE(excluded.physical_device_id, devices.physical_device_id),
@@ -208,6 +257,10 @@ export class DeviceStore {
         last_known_ip = COALESCE(excluded.last_known_ip, devices.last_known_ip),
         battery_level = COALESCE(excluded.battery_level, devices.battery_level),
         battery_charging = COALESCE(excluded.battery_charging, devices.battery_charging),
+        lease_state = COALESCE(excluded.lease_state, devices.lease_state),
+        leased_by = excluded.leased_by,
+        lease_expires_at = excluded.lease_expires_at,
+        last_heartbeat_at = excluded.last_heartbeat_at,
         updated_at = excluded.updated_at
     `);
 
@@ -245,6 +298,21 @@ export class DeviceStore {
         updated_at = excluded.updated_at
     `);
     this.stmtGetAllPhysicalMappings = this.db.prepare(`SELECT * FROM physical_devices`);
+    this.stmtUpsertLease = this.db.prepare(`
+      INSERT INTO leases (
+        physical_device_id, lease_state, leased_by, lease_expires_at, last_heartbeat_at, updated_at
+      ) VALUES (
+        @physicalDeviceId, @leaseState, @leasedBy, @leaseExpiresAt, @lastHeartbeatAt, @updatedAt
+      )
+      ON CONFLICT(physical_device_id) DO UPDATE SET
+        lease_state = excluded.lease_state,
+        leased_by = excluded.leased_by,
+        lease_expires_at = excluded.lease_expires_at,
+        last_heartbeat_at = excluded.last_heartbeat_at,
+        updated_at = excluded.updated_at
+    `);
+    this.stmtGetLease = this.db.prepare(`SELECT * FROM leases WHERE physical_device_id = ?`);
+    this.stmtGetAllLeases = this.db.prepare(`SELECT * FROM leases`);
   }
 
   private migrateFromJsonIfEmpty(jsonPath: string) {
@@ -279,6 +347,19 @@ export class DeviceStore {
             lastKnownIp: dev.lastKnownIp || null,
             batteryLevel: dev.battery?.level ?? null,
             batteryCharging: dev.battery?.charging ? 1 : 0,
+            leaseState: 'available',
+            leasedBy: null,
+            leaseExpiresAt: null,
+            lastHeartbeatAt: null,
+            updatedAt: now
+          });
+
+          this.stmtUpsertLease.run({
+            physicalDeviceId: physId,
+            leaseState: 'available',
+            leasedBy: null,
+            leaseExpiresAt: null,
+            lastHeartbeatAt: null,
             updatedAt: now
           });
 
@@ -302,6 +383,25 @@ export class DeviceStore {
   }
 
   private loadAllIntoMemory() {
+    // 1. Load physical leases from SQLite
+    this.leases.clear();
+    try {
+      const leaseRows = this.stmtGetAllLeases.all() as any[];
+      for (const lr of leaseRows) {
+        this.leases.set(lr.physical_device_id, {
+          physicalDeviceId: lr.physical_device_id,
+          state: (lr.lease_state as LeaseState) || 'available',
+          leasedBy: lr.leased_by || undefined,
+          leaseExpiresAt: lr.lease_expires_at || undefined,
+          lastHeartbeatAt: lr.last_heartbeat_at || undefined,
+          updatedAt: lr.updated_at
+        });
+      }
+    } catch (err) {
+      console.warn('[DeviceStore] Failed to load leases from SQLite:', err);
+    }
+
+    // 2. Load devices from SQLite
     this.inMemoryDevices.clear();
     const rows = this.stmtSelectAllDevices.all() as any[];
     for (const r of rows) {
@@ -311,10 +411,24 @@ export class DeviceStore {
       } catch {}
 
       const history = (this.stmtGetHistory.all(r.id, 50) as { action: string; timestamp: string }[]) || [];
+      const physId = r.physical_device_id || `phys_${r.serial || r.id}`;
+
+      let lease = this.leases.get(physId);
+      if (!lease) {
+        lease = {
+          physicalDeviceId: physId,
+          state: (r.lease_state as LeaseState) || 'available',
+          leasedBy: r.leased_by || undefined,
+          leaseExpiresAt: r.lease_expires_at || undefined,
+          lastHeartbeatAt: r.last_heartbeat_at || undefined,
+          updatedAt: Date.now()
+        };
+        this.leases.set(physId, lease);
+      }
 
       const dev: DeviceData = {
         id: r.id,
-        physicalDeviceId: r.physical_device_id || undefined,
+        physicalDeviceId: physId,
         serial: r.serial || r.id,
         status: r.status,
         model: r.model || undefined,
@@ -329,6 +443,10 @@ export class DeviceStore {
         battery: (r.battery_level !== null && r.battery_level !== undefined)
           ? { level: r.battery_level, charging: Boolean(r.battery_charging) }
           : undefined,
+        leaseState: lease.state,
+        leasedBy: lease.leasedBy,
+        leaseExpiresAt: lease.leaseExpiresAt,
+        lastHeartbeatAt: lease.lastHeartbeatAt,
         history
       };
 
@@ -454,6 +572,19 @@ export class DeviceStore {
     const mergedIsBareBoard = surviving.isBareBoard ?? losing.isBareBoard ?? false;
     const mergedLastKnownIp = surviving.lastKnownIp || losing.lastKnownIp;
 
+    const mergedLeaseState = (surviving.leaseState && surviving.leaseState !== 'available')
+      ? surviving.leaseState
+      : (losing.leaseState || surviving.leaseState || 'available');
+    const mergedLeasedBy = (surviving.leaseState && surviving.leaseState !== 'available')
+      ? surviving.leasedBy
+      : (losing.leasedBy || surviving.leasedBy);
+    const mergedLeaseExpiresAt = (surviving.leaseState && surviving.leaseState !== 'available')
+      ? surviving.leaseExpiresAt
+      : (losing.leaseExpiresAt || surviving.leaseExpiresAt);
+    const mergedLastHeartbeatAt = (surviving.leaseState && surviving.leaseState !== 'available')
+      ? surviving.lastHeartbeatAt
+      : (losing.lastHeartbeatAt || surviving.lastHeartbeatAt);
+
     // Re-parent history rows in SQLite
     try {
       this.stmtReparentHistory.run(survivingId, losingId);
@@ -493,6 +624,10 @@ export class DeviceStore {
       name: mergedName,
       isBareBoard: mergedIsBareBoard,
       lastKnownIp: mergedLastKnownIp,
+      leaseState: mergedLeaseState,
+      leasedBy: mergedLeasedBy,
+      leaseExpiresAt: mergedLeaseExpiresAt,
+      lastHeartbeatAt: mergedLastHeartbeatAt,
       history: updatedHistory
     };
 
@@ -632,6 +767,10 @@ export class DeviceStore {
             lastKnownIp: patch.lastKnownIp ?? current.lastKnownIp ?? null,
             batteryLevel: patch.battery?.level ?? current.battery?.level ?? null,
             batteryCharging: (patch.battery?.charging ?? current.battery?.charging) ? 1 : 0,
+            leaseState: patch.leaseState ?? current.leaseState ?? 'available',
+            leasedBy: patch.leasedBy !== undefined ? patch.leasedBy : (current.leasedBy ?? null),
+            leaseExpiresAt: patch.leaseExpiresAt !== undefined ? patch.leaseExpiresAt : (current.leaseExpiresAt ?? null),
+            lastHeartbeatAt: patch.lastHeartbeatAt !== undefined ? patch.lastHeartbeatAt : (current.lastHeartbeatAt ?? null),
             updatedAt: now
           });
         }
@@ -640,6 +779,246 @@ export class DeviceStore {
       tx();
     } catch (err) {
       console.error('[SQLite] Failed to flush debounced writes:', err);
+    }
+  }
+
+  // --- Device Lease State Machine ---
+
+  getLease(physicalDeviceId: string): DeviceLeaseInfo {
+    const existing = this.leases.get(physicalDeviceId);
+    if (existing) return existing;
+    try {
+      const row = this.stmtGetLease.get(physicalDeviceId) as any;
+      if (row) {
+        const lease: DeviceLeaseInfo = {
+          physicalDeviceId: row.physical_device_id,
+          state: (row.lease_state as LeaseState) || 'available',
+          leasedBy: row.leased_by || undefined,
+          leaseExpiresAt: row.lease_expires_at || undefined,
+          lastHeartbeatAt: row.last_heartbeat_at || undefined,
+          updatedAt: row.updated_at
+        };
+        this.leases.set(physicalDeviceId, lease);
+        return lease;
+      }
+    } catch {}
+    return {
+      physicalDeviceId,
+      state: 'available',
+      updatedAt: Date.now()
+    };
+  }
+
+  saveLease(lease: DeviceLeaseInfo): string[] {
+    this.leases.set(lease.physicalDeviceId, lease);
+    try {
+      this.stmtUpsertLease.run({
+        physicalDeviceId: lease.physicalDeviceId,
+        leaseState: lease.state,
+        leasedBy: lease.leasedBy ?? null,
+        leaseExpiresAt: lease.leaseExpiresAt ?? null,
+        lastHeartbeatAt: lease.lastHeartbeatAt ?? null,
+        updatedAt: lease.updatedAt
+      });
+    } catch (err) {
+      console.warn(`[DeviceStore] Failed to persist lease for ${lease.physicalDeviceId}:`, err);
+    }
+
+    // Update in-memory devices matching this physicalDeviceId
+    const affectedIds: string[] = [];
+    for (const [id, dev] of this.inMemoryDevices.entries()) {
+      if (dev.physicalDeviceId === lease.physicalDeviceId || (!dev.physicalDeviceId && (dev.serial === lease.physicalDeviceId || `phys_${dev.serial}` === lease.physicalDeviceId))) {
+        dev.leaseState = lease.state;
+        dev.leasedBy = lease.leasedBy;
+        dev.leaseExpiresAt = lease.leaseExpiresAt;
+        dev.lastHeartbeatAt = lease.lastHeartbeatAt;
+        affectedIds.push(id);
+
+        const pending = this.pendingWrites.get(id) || {};
+        this.pendingWrites.set(id, {
+          ...pending,
+          leaseState: lease.state,
+          leasedBy: lease.leasedBy,
+          leaseExpiresAt: lease.leaseExpiresAt,
+          lastHeartbeatAt: lease.lastHeartbeatAt
+        });
+      }
+    }
+    this.scheduleDebouncedFlush();
+    return affectedIds;
+  }
+
+  acquireLease(physicalDeviceId: string, sessionId: string, ttlMinutes = 15): { success: boolean; error?: string; lease?: DeviceLeaseInfo; affectedDeviceIds: string[] } {
+    if (!physicalDeviceId || !sessionId) {
+      return { success: false, error: 'physicalDeviceId and sessionId are required', affectedDeviceIds: [] };
+    }
+
+    const current = this.getLease(physicalDeviceId);
+    const now = Date.now();
+
+    // Check current lease state
+    if (current.state === 'leased') {
+      // If lease is expired, allow taking it over
+      if (current.leaseExpiresAt && current.leaseExpiresAt <= now) {
+        // Expired lease, proceed with acquisition
+      } else if (current.leasedBy && current.leasedBy !== sessionId) {
+        return {
+          success: false,
+          error: `Device is currently leased by session '${current.leasedBy}' until ${new Date(current.leaseExpiresAt || now).toLocaleTimeString()}`,
+          affectedDeviceIds: []
+        };
+      }
+    } else if (current.state === 'cooling_down') {
+      if (current.leaseExpiresAt && current.leaseExpiresAt > now) {
+        const remainingSec = Math.ceil((current.leaseExpiresAt - now) / 1000);
+        return {
+          success: false,
+          error: `Device is cooling down (${remainingSec}s remaining). Please wait.`,
+          affectedDeviceIds: []
+        };
+      }
+    } else if (current.state === 'quarantined') {
+      return { success: false, error: 'Device is quarantined and unavailable for lease.', affectedDeviceIds: [] };
+    } else if (current.state === 'maintenance') {
+      return { success: false, error: 'Device is in maintenance mode and unavailable for lease.', affectedDeviceIds: [] };
+    }
+
+    const ttlMs = Math.max(0.1, ttlMinutes) * 60 * 1000;
+    const newLease: DeviceLeaseInfo = {
+      physicalDeviceId,
+      state: 'leased',
+      leasedBy: sessionId,
+      leaseExpiresAt: Math.round(now + ttlMs),
+      lastHeartbeatAt: now,
+      updatedAt: now
+    };
+
+    const affected = this.saveLease(newLease);
+    this.logPhysicalAction(physicalDeviceId, `Lease acquired by '${sessionId}' (TTL: ${ttlMinutes}m)`);
+    return { success: true, lease: newLease, affectedDeviceIds: affected };
+  }
+
+  releaseLease(physicalDeviceId: string, sessionId: string, force = false): { success: boolean; error?: string; affectedDeviceIds: string[] } {
+    if (!physicalDeviceId) {
+      return { success: false, error: 'physicalDeviceId is required', affectedDeviceIds: [] };
+    }
+
+    const current = this.getLease(physicalDeviceId);
+    if (current.state !== 'leased') {
+      return { success: true, affectedDeviceIds: [] };
+    }
+
+    if (!force && sessionId && current.leasedBy && current.leasedBy !== sessionId) {
+      return {
+        success: false,
+        error: `Cannot release lease held by session '${current.leasedBy}'`,
+        affectedDeviceIds: []
+      };
+    }
+
+    const now = Date.now();
+    // Transition leased -> cooling_down for 5-second grace period
+    const newLease: DeviceLeaseInfo = {
+      physicalDeviceId,
+      state: 'cooling_down',
+      leasedBy: undefined,
+      leaseExpiresAt: now + 5000,
+      lastHeartbeatAt: undefined,
+      updatedAt: now
+    };
+
+    const affected = this.saveLease(newLease);
+    this.logPhysicalAction(physicalDeviceId, `Lease released by '${sessionId || 'system'}', cooling down for 5s`);
+    return { success: true, affectedDeviceIds: affected };
+  }
+
+  heartbeatLease(physicalDeviceId: string, sessionId: string, extensionMinutes?: number): { success: boolean; error?: string; leaseExpiresAt?: number; affectedDeviceIds: string[] } {
+    if (!physicalDeviceId || !sessionId) {
+      return { success: false, error: 'physicalDeviceId and sessionId are required', affectedDeviceIds: [] };
+    }
+
+    const current = this.getLease(physicalDeviceId);
+    const now = Date.now();
+
+    if (current.state !== 'leased' || current.leasedBy !== sessionId) {
+      return { success: false, error: 'No active lease held by this session', affectedDeviceIds: [] };
+    }
+
+    current.lastHeartbeatAt = now;
+    if (extensionMinutes && extensionMinutes > 0) {
+      current.leaseExpiresAt = Math.round(now + extensionMinutes * 60 * 1000);
+    }
+    current.updatedAt = now;
+
+    const affected = this.saveLease(current);
+    return { success: true, leaseExpiresAt: current.leaseExpiresAt, affectedDeviceIds: affected };
+  }
+
+  setDeviceLeaseState(physicalDeviceId: string, state: LeaseState, sessionId?: string): { success: boolean; error?: string; affectedDeviceIds: string[] } {
+    if (!physicalDeviceId) {
+      return { success: false, error: 'physicalDeviceId is required', affectedDeviceIds: [] };
+    }
+
+    const now = Date.now();
+    const newLease: DeviceLeaseInfo = {
+      physicalDeviceId,
+      state,
+      leasedBy: state === 'leased' ? sessionId : undefined,
+      leaseExpiresAt: state === 'cooling_down' ? (now + 5000) : (state === 'leased' ? (now + 15 * 60 * 1000) : undefined),
+      lastHeartbeatAt: state === 'leased' ? now : undefined,
+      updatedAt: now
+    };
+
+    const affected = this.saveLease(newLease);
+    this.logPhysicalAction(physicalDeviceId, `Lease state changed to '${state}'${sessionId ? ` (session: ${sessionId})` : ''}`);
+    return { success: true, affectedDeviceIds: affected };
+  }
+
+  sweepExpiredLeases(): { changedLeases: DeviceLeaseInfo[]; affectedDeviceIds: string[] } {
+    const now = Date.now();
+    const changedLeases: DeviceLeaseInfo[] = [];
+    const allAffectedIds = new Set<string>();
+
+    for (const [physId, lease] of this.leases.entries()) {
+      if (lease.state === 'leased' && lease.leaseExpiresAt && lease.leaseExpiresAt <= now) {
+        console.log(`[Lease Sweep] Lease expired for physical device ${physId} (held by ${lease.leasedBy}). Auto-releasing to available.`);
+        const updated: DeviceLeaseInfo = {
+          physicalDeviceId: physId,
+          state: 'available',
+          leasedBy: undefined,
+          leaseExpiresAt: undefined,
+          lastHeartbeatAt: undefined,
+          updatedAt: now
+        };
+        const affected = this.saveLease(updated);
+        changedLeases.push(updated);
+        for (const id of affected) allAffectedIds.add(id);
+        this.logPhysicalAction(physId, `Lease expired without renewal; auto-returned to available`);
+      } else if (lease.state === 'cooling_down' && lease.leaseExpiresAt && lease.leaseExpiresAt <= now) {
+        console.log(`[Lease Sweep] Cooldown completed for physical device ${physId}. Transitioning to available.`);
+        const updated: DeviceLeaseInfo = {
+          physicalDeviceId: physId,
+          state: 'available',
+          leasedBy: undefined,
+          leaseExpiresAt: undefined,
+          lastHeartbeatAt: undefined,
+          updatedAt: now
+        };
+        const affected = this.saveLease(updated);
+        changedLeases.push(updated);
+        for (const id of affected) allAffectedIds.add(id);
+        this.logPhysicalAction(physId, `Cooldown period elapsed; returned to available`);
+      }
+    }
+
+    return { changedLeases, affectedDeviceIds: Array.from(allAffectedIds) };
+  }
+
+  logPhysicalAction(physicalDeviceId: string, action: string) {
+    for (const dev of this.inMemoryDevices.values()) {
+      if (dev.physicalDeviceId === physicalDeviceId || dev.serial === physicalDeviceId) {
+        this.logDeviceAction(dev.id, action);
+      }
     }
   }
 

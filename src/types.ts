@@ -1,3 +1,12 @@
+export type LeaseState = 'available' | 'leased' | 'cooling_down' | 'quarantined' | 'maintenance';
+
+export interface DeviceLeaseInfo {
+  state: LeaseState;
+  leasedBy?: string;
+  leaseExpiresAt?: number;
+  lastHeartbeatAt?: number;
+}
+
 export interface DeviceData {
   id: string;
   physicalDeviceId?: string;
@@ -15,6 +24,10 @@ export interface DeviceData {
   connectedAt?: number;
   lastKnownIp?: string;
   battery?: { level: number; charging: boolean };
+  leaseState?: LeaseState;
+  leasedBy?: string;
+  leaseExpiresAt?: number;
+  lastHeartbeatAt?: number;
 }
 
 export interface QuickPhrase {
@@ -41,9 +54,9 @@ declare global {
     electronAPI: {
       getDevices: () => Promise<DeviceData[]>;
       launchScrcpy: (deviceId: string, options?: { maxFps?: number, maxSize?: number }) => Promise<{success: boolean, error?: string}>;
-      rebootDevice: (deviceId: string) => Promise<{success: boolean, error?: string}>;
+      rebootDevice: (deviceId: string, sessionId?: string) => Promise<{success: boolean, error?: string}>;
       openLink: (deviceId: string, url: string) => Promise<{success: boolean, error?: string}>;
-      installApk: (deviceId: string, apkPath: string) => Promise<{success: boolean, error?: string}>;
+      installApk: (deviceId: string, apkPath: string, sessionId?: string) => Promise<{success: boolean, error?: string}>;
       updateDeviceData: (deviceId: string, data: Partial<DeviceData>) => Promise<boolean>;
       onDevicesUpdated: (callback: (update: DeviceData[] | DeviceDelta) => void) => void;
       switchToWireless: (deviceId: string) => Promise<{success: boolean, ip?: string, error?: string}>;
@@ -56,14 +69,14 @@ declare global {
       takeScreenshot: (deviceId: string) => Promise<{success: boolean, path?: string, error?: string}>;
       
       syncClipboard: (deviceId: string, direction: 'toDevice' | 'fromDevice', text?: string) => Promise<{success: boolean, text?: string, error?: string}>;
-      sendText: (deviceId: string, text: string) => Promise<{success: boolean, error?: string}>;
-      pushFile: (deviceId: string, localPath: string, remotePath: string) => Promise<{success: boolean, error?: string}>;
+      sendText: (deviceId: string, text: string, sessionId?: string) => Promise<{success: boolean, error?: string}>;
+      pushFile: (deviceId: string, localPath: string, remotePath: string, sessionId?: string) => Promise<{success: boolean, error?: string}>;
       pullFile: (deviceId: string, remotePath: string, localPath: string) => Promise<{success: boolean, error?: string}>;
       
       launchApp: (deviceId: string, packageName: string) => Promise<{success: boolean, error?: string}>;
-      clearAppCache: (deviceId: string, packageName: string) => Promise<{success: boolean, error?: string}>;
+      clearAppCache: (deviceId: string, packageName: string, sessionId?: string) => Promise<{success: boolean, error?: string}>;
       
-      runAdbCommand: (deviceId: string, command: string) => Promise<{success: boolean, output?: string, error?: string}>;
+      runAdbCommand: (deviceId: string, command: string, sessionId?: string) => Promise<{success: boolean, output?: string, error?: string}>;
       openSettings: (deviceId: string, intent: 'wifi' | 'ime' | 'accessibility') => Promise<{success: boolean, error?: string}>;
       locateDevice: (deviceId: string) => Promise<{success: boolean, error?: string}>;
       saveTestAccountPassword: (accountId: string, password: string) => Promise<{success: boolean, error?: string}>;
@@ -81,6 +94,10 @@ declare global {
       retryDevice: (deviceId: string) => Promise<{ok: boolean}>;
       getPhysicalDeviceMappings?: () => Promise<any[]>;
       getPhysicalDeviceMapping?: (physicalDeviceId: string) => Promise<any>;
+      acquireLease?: (physicalDeviceId: string, sessionId: string, ttlMinutes?: number) => Promise<{ success: boolean; error?: string; lease?: DeviceLeaseInfo }>;
+      releaseLease?: (physicalDeviceId: string, sessionId: string) => Promise<{ success: boolean; error?: string }>;
+      heartbeatLease?: (physicalDeviceId: string, sessionId: string, extensionMinutes?: number) => Promise<{ success: boolean; error?: string; leaseExpiresAt?: number }>;
+      setDeviceLeaseState?: (physicalDeviceId: string, state: LeaseState, sessionId?: string) => Promise<{ success: boolean; error?: string }>;
     };
   }
 }

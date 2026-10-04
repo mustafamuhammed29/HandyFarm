@@ -53,6 +53,68 @@ function broadcastDelta(deviceId: string, patch: Partial<DeviceData>, removed = 
   }
 }
 
+/**
+ * Guard function to enforce exclusive device lease access on destructive actions.
+ * Allows action if device is available or caller sessionId holds the active lease.
+ * Blocks if device is leased by another session, cooling down, quarantined, or in maintenance.
+ */
+export function checkDeviceLeaseGuard(deviceId: string, sessionId?: string): { allowed: boolean; error?: string } {
+  const dev = deviceStore.getDevice(deviceId);
+  if (!dev) return { allowed: true };
+  const physId = dev.physicalDeviceId || `phys_${dev.serial || dev.id}`;
+  const lease = deviceStore.getLease(physId);
+
+  // If cooling_down, quarantined, or maintenance, reject immediately
+  if (lease.state === 'cooling_down') {
+    const remaining = lease.leaseExpiresAt ? Math.max(0, Math.ceil((lease.leaseExpiresAt - Date.now()) / 1000)) : 5;
+    return { allowed: false, error: `Device is cooling down (${remaining}s remaining). Exclusive actions are temporarily blocked.` };
+  }
+  if (lease.state === 'quarantined') {
+    return { allowed: false, error: 'Device is quarantined. Exclusive actions are blocked.' };
+  }
+  if (lease.state === 'maintenance') {
+    return { allowed: false, error: 'Device is under maintenance. Exclusive actions are blocked.' };
+  }
+
+  // If leased, verify caller sessionId matches lease holder
+  if (lease.state === 'leased') {
+    const now = Date.now();
+    if (lease.leaseExpiresAt && lease.leaseExpiresAt <= now) {
+      // Lease TTL expired without renewal -> auto-release
+      deviceStore.sweepExpiredLeases();
+      return { allowed: true };
+    }
+    if (!sessionId || sessionId !== lease.leasedBy) {
+      const expiresStr = lease.leaseExpiresAt ? new Date(lease.leaseExpiresAt).toLocaleTimeString() : 'unknown';
+      return { allowed: false, error: `Device is leased by session '${lease.leasedBy}' until ${expiresStr}. Exclusive action rejected.` };
+    }
+  }
+
+  return { allowed: true };
+}
+
+// Periodic sweep for expired leases & cooldown periods (every 2 seconds)
+setInterval(() => {
+  try {
+    const { changedLeases, affectedDeviceIds } = deviceStore.sweepExpiredLeases();
+    if (changedLeases.length > 0) {
+      for (const id of affectedDeviceIds) {
+        const dev = deviceStore.getDevice(id);
+        if (dev) {
+          broadcastDelta(id, {
+            leaseState: dev.leaseState,
+            leasedBy: dev.leasedBy ?? (null as any),
+            leaseExpiresAt: dev.leaseExpiresAt ?? (null as any),
+            lastHeartbeatAt: dev.lastHeartbeatAt ?? (null as any)
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[Lease Sweep] Error sweeping expired leases:', err);
+  }
+}, 2000);
+
 // Run dedupe once on startup to clean up and merge any duplicates in the database
 const allInitialDevices = deviceStore.getAllDevices(false);
 for (let i = 0; i < allInitialDevices.length; i++) {
@@ -614,9 +676,15 @@ function closeLiveView(deviceId: string, reason: string) {
   }
 }
 
-ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, videoBitRate = 2000000) => {
+ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, videoBitRate = 2000000, sessionId?: string) => {
   console.log(`[POC] Starting Live View for ${deviceId}`);
   
+  // Phase 5: Lease Guard Check
+  const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
+  if (!leaseGuard.allowed) {
+    return { success: false, error: leaseGuard.error };
+  }
+
   // Phase 4: DeviceId validation
   const connected = deviceStore.getDevice(deviceId);
   if (!connected || connected.status !== 'device') {
@@ -907,7 +975,11 @@ function sanitizeFreeText(text: string): string {
   return sanitized;
 }
 
-ipcMain.handle('reboot-device', async (_event, deviceId) => {
+ipcMain.handle('reboot-device', async (_event, deviceId, sessionId?: string) => {
+  const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
+  if (!leaseGuard.allowed) {
+    return { success: false, error: leaseGuard.error };
+  }
   try {
     await client.getDevice(deviceId).reboot();
     logAction(deviceId, 'Rebooted device');
@@ -967,7 +1039,11 @@ ipcMain.handle('open-link', async (_event, deviceId, url) => {
   }
 });
 
-ipcMain.handle('install-apk', async (_event, deviceId, apkPath) => {
+ipcMain.handle('install-apk', async (_event, deviceId, apkPath, sessionId?: string) => {
+  const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
+  if (!leaseGuard.allowed) {
+    return { success: false, error: leaseGuard.error };
+  }
   try {
     await client.getDevice(deviceId).install(apkPath);
     logAction(deviceId, `Installed APK: ${apkPath}`);
@@ -1188,7 +1264,11 @@ ipcMain.handle('switch-to-wireless', async (_event, deviceId) => {
   }
 });
 
-ipcMain.handle('send-text', async (_event, deviceId, text) => {
+ipcMain.handle('send-text', async (_event, deviceId, text, sessionId?: string) => {
+  const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
+  if (!leaseGuard.allowed) {
+    return { success: false, error: leaseGuard.error };
+  }
   try {
     const sanitized = sanitizeFreeText(text);
     await client.getDevice(deviceId).shell(`input text "${sanitized}"`);
@@ -1199,7 +1279,11 @@ ipcMain.handle('send-text', async (_event, deviceId, text) => {
   }
 });
 
-ipcMain.handle('push-file', async (_event, deviceId, localPath, remotePath) => {
+ipcMain.handle('push-file', async (_event, deviceId, localPath, remotePath, sessionId?: string) => {
+  const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
+  if (!leaseGuard.allowed) {
+    return { success: false, error: leaseGuard.error };
+  }
   try {
     await client.getDevice(deviceId).push(localPath, remotePath);
     logAction(deviceId, `Pushed file to ${remotePath}`);
@@ -1239,7 +1323,11 @@ ipcMain.handle('launch-app', async (_event, deviceId, packageName) => {
   }
 });
 
-ipcMain.handle('clear-app-cache', async (_event, deviceId, packageName) => {
+ipcMain.handle('clear-app-cache', async (_event, deviceId, packageName, sessionId?: string) => {
+  const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
+  if (!leaseGuard.allowed) {
+    return { success: false, error: leaseGuard.error };
+  }
   try {
     if (!isValidPackageName(packageName)) {
       return { success: false, error: 'Invalid package name format' };
@@ -1261,7 +1349,11 @@ ipcMain.handle('check-adb-status', async () => {
   }
 });
 
-ipcMain.handle('run-adb-command', async (_event, deviceId, command) => {
+ipcMain.handle('run-adb-command', async (_event, deviceId, command, sessionId?: string) => {
+  const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
+  if (!leaseGuard.allowed) {
+    return { success: false, error: leaseGuard.error };
+  }
   try {
     const stream = await client.getDevice(deviceId).shell(command);
     const output = await Adb.util.readAll(stream);
@@ -1472,4 +1564,73 @@ ipcMain.handle('get-physical-device-mappings', async () => {
 ipcMain.handle('get-physical-device-mapping', async (_event, physicalDeviceId: string) => {
   return deviceStore.getPhysicalMapping(physicalDeviceId);
 });
+
+// --- Phase 5 Lease Management IPC Handlers ---
+
+ipcMain.handle('acquire-lease', async (_event, physicalDeviceId: string, sessionId: string, ttlMinutes?: number) => {
+  const res = deviceStore.acquireLease(physicalDeviceId, sessionId, ttlMinutes);
+  if (res.success && res.lease) {
+    for (const devId of res.affectedDeviceIds) {
+      const dev = deviceStore.getDevice(devId);
+      if (dev) {
+        broadcastDelta(devId, {
+          leaseState: res.lease.state,
+          leasedBy: res.lease.leasedBy,
+          leaseExpiresAt: res.lease.leaseExpiresAt,
+          lastHeartbeatAt: res.lease.lastHeartbeatAt
+        });
+      }
+    }
+  }
+  return res;
+});
+
+ipcMain.handle('release-lease', async (_event, physicalDeviceId: string, sessionId: string) => {
+  const res = deviceStore.releaseLease(physicalDeviceId, sessionId);
+  if (res.success) {
+    const lease = deviceStore.getLease(physicalDeviceId);
+    for (const devId of res.affectedDeviceIds) {
+      broadcastDelta(devId, {
+        leaseState: lease.state,
+        leasedBy: lease.leasedBy ?? (null as any),
+        leaseExpiresAt: lease.leaseExpiresAt ?? (null as any),
+        lastHeartbeatAt: lease.lastHeartbeatAt ?? (null as any)
+      });
+    }
+  }
+  return res;
+});
+
+ipcMain.handle('heartbeat-lease', async (_event, physicalDeviceId: string, sessionId: string, extensionMinutes?: number) => {
+  const res = deviceStore.heartbeatLease(physicalDeviceId, sessionId, extensionMinutes);
+  if (res.success) {
+    const lease = deviceStore.getLease(physicalDeviceId);
+    for (const devId of res.affectedDeviceIds) {
+      broadcastDelta(devId, {
+        leaseState: lease.state,
+        leasedBy: lease.leasedBy ?? (null as any),
+        leaseExpiresAt: lease.leaseExpiresAt ?? (null as any),
+        lastHeartbeatAt: lease.lastHeartbeatAt ?? (null as any)
+      });
+    }
+  }
+  return res;
+});
+
+ipcMain.handle('set-device-lease-state', async (_event, physicalDeviceId: string, state: any, sessionId?: string) => {
+  const res = deviceStore.setDeviceLeaseState(physicalDeviceId, state, sessionId);
+  if (res.success) {
+    const lease = deviceStore.getLease(physicalDeviceId);
+    for (const devId of res.affectedDeviceIds) {
+      broadcastDelta(devId, {
+        leaseState: lease.state,
+        leasedBy: lease.leasedBy ?? (null as any),
+        leaseExpiresAt: lease.leaseExpiresAt ?? (null as any),
+        lastHeartbeatAt: lease.lastHeartbeatAt ?? (null as any)
+      });
+    }
+  }
+  return res;
+});
+
 
