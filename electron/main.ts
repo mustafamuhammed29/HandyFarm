@@ -1558,8 +1558,12 @@ ipcMain.handle('run-adb-command', async (_event, deviceId, command, sessionId?: 
   try {
     const stream = await client.getDevice(deviceId).shell(trimmed);
     const output = await Adb.util.readAll(stream);
+    const rawOutput = output.toString();
+    const finalOutput = (trimmed.startsWith('logcat') || trimmed.includes('logcat'))
+      ? redactLogcatText(rawOutput)
+      : rawOutput;
     logAction(deviceId, `Ran command: ${trimmed}`);
-    return { success: true, output: output.toString() };
+    return { success: true, output: finalOutput };
   } catch (e: any) {
     return { success: false, error: e.message };
   }
