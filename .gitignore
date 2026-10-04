@@ -31,3 +31,24 @@ handyfarm-clipper/build/
 handyfarm-clipper/.gradle/
 scratch/adversary/build/
 
+# --- Secrets: never commit key material or tunnel configs ---
+# WireGuard / sing-box tunnel configs contain private keys. Keep them local only.
+scratch/*.conf
+scratch/*.key
+scratch/*.sock
+scratch/test-wg-server.json
+scratch/test-local-wg-client.json
+scratch/wg-client.conf
+scratch/.oldkey-probe*.json
+# Generic key/cert material anywhere in the tree
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.sock
+# Local auth/token files
+api-auth.json
+*.env
+.env*
+
