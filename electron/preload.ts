@@ -55,6 +55,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   releaseLease: (physicalDeviceId: string, sessionId: string) => ipcRenderer.invoke('release-lease', physicalDeviceId, sessionId),
   heartbeatLease: (physicalDeviceId: string, sessionId: string, extensionMinutes?: number) => ipcRenderer.invoke('heartbeat-lease', physicalDeviceId, sessionId, extensionMinutes),
   setDeviceLeaseState: (physicalDeviceId: string, state: string, sessionId?: string) => ipcRenderer.invoke('set-device-lease-state', physicalDeviceId, state, sessionId),
+  getExpertMode: () => ipcRenderer.invoke('get-expert-mode'),
+  setExpertMode: (enabled: boolean) => ipcRenderer.invoke('set-expert-mode', enabled),
 });
 
 

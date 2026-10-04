@@ -2,10 +2,10 @@ console.log('BUILD CANARY:', Date.now(), 'ALPHA-BRAVO-123');
 import { app, BrowserWindow, ipcMain, safeStorage, dialog, clipboard } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { fork, ChildProcess, exec, spawn } from 'child_process';
+import { fork, ChildProcess, spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 import adbkit from '@devicefarmer/adbkit';
 const Adb = (adbkit as any).Adb || (adbkit as any).default?.Adb || (adbkit as any).default || adbkit;
 import fs from 'fs';
@@ -211,7 +211,7 @@ function createWindow() {
     height: 800,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
-      sandbox: false,
+      sandbox: true,
     },
   });
 
@@ -411,8 +411,10 @@ async function startAdbTracker() {
           if (!hasActiveWifi) {
             console.log(`[Auto-Reconnect] Attempting to reconnect offline device ${deviceId} via last known IP ${dev.lastKnownIp}:5555`);
             try {
-              const { stdout } = await execAsync(`adb connect ${dev.lastKnownIp}:5555`);
-              console.log(`[Auto-Reconnect] Output for ${dev.lastKnownIp}: ${stdout}`);
+              if (/^(\d{1,3}\.){3}\d{1,3}$/.test(dev.lastKnownIp)) {
+                const { stdout } = await execFileAsync('adb', ['connect', `${dev.lastKnownIp}:5555`]);
+                console.log(`[Auto-Reconnect] Output for ${dev.lastKnownIp}: ${stdout}`);
+              }
             } catch (e) {
               console.error(`[Auto-Reconnect] Failed for ${dev.lastKnownIp}`);
             }
@@ -718,7 +720,7 @@ ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, vi
   // 1) Read initial stay_on_while_plugged_in value
   let originalStayOnValue = '0';
   try {
-    const { stdout } = await execAsync(`adb -s ${deviceId} shell settings get global stay_on_while_plugged_in`);
+    const { stdout } = await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'get', 'global', 'stay_on_while_plugged_in']);
     originalStayOnValue = stdout.trim();
   } catch (e) {
     console.error('[POC] Failed to read stay_on_while_plugged_in', e);
@@ -726,8 +728,8 @@ ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, vi
   
   // 2) Set to 3 (stay awake) and wake device up
   try {
-    await execAsync(`adb -s ${deviceId} shell settings put global stay_on_while_plugged_in 3`);
-    await execAsync(`adb -s ${deviceId} shell input keyevent 224`);
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'global', 'stay_on_while_plugged_in', '3']);
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'input', 'keyevent', '224']);
   } catch (e) {
     console.error('[POC] Failed to set stay_on/wake up', e);
   }
@@ -952,7 +954,7 @@ ipcMain.handle('start-live-view-poc', async (_event, deviceId, maxSize = 800, vi
 
         // Restore stay_on_while_plugged_in
         try {
-          await execAsync(`adb -s ${deviceId} shell settings put global stay_on_while_plugged_in ${originalStayOnValue}`);
+          await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'global', 'stay_on_while_plugged_in', String(originalStayOnValue)]);
         } catch (e) {
           console.error('[POC] Failed to restore stay_on_while_plugged_in', e);
         }
@@ -983,12 +985,6 @@ function isValidPackageName(pkg: string): boolean {
   return /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/.test(pkg);
 }
 
-function sanitizeFreeText(text: string): string {
-  let sanitized = text.replace(/[`;&|]/g, '');
-  sanitized = sanitized.replace(/([$()"\\])/g, '\\$1');
-  return sanitized;
-}
-
 ipcMain.handle('reboot-device', async (_event, deviceId, sessionId?: string) => {
   const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
   if (!leaseGuard.allowed) {
@@ -1004,11 +1000,15 @@ ipcMain.handle('reboot-device', async (_event, deviceId, sessionId?: string) => 
 });
 
 async function openUrlRobust(deviceId: string, url: string) {
+  if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('data:text/html')) {
+    throw new Error('Disallowed URL scheme. Only http, https, and data:text/html are supported.');
+  }
+
   let target = '';
   try {
-    const resolveCmd = `adb -s ${deviceId} shell pm resolve-activity -a android.intent.action.VIEW -d "${url}"`;
-    console.log(`[openUrlRobust] Resolving: ${resolveCmd}`);
-    const { stdout } = await execAsync(resolveCmd);
+    const resolveArgs = ['-s', deviceId, 'shell', 'pm', 'resolve-activity', '-a', 'android.intent.action.VIEW', '-d', url];
+    console.log(`[openUrlRobust] Resolving activity for ${deviceId}`);
+    const { stdout } = await execFileAsync('adb', resolveArgs);
     
     // Look for something like "com.android.chrome/com.google.android.apps.chrome.Main"
     // that indicates a resolved component
@@ -1020,13 +1020,13 @@ async function openUrlRobust(deviceId: string, url: string) {
     console.warn(`[openUrlRobust] Failed to resolve activity for ${deviceId}: ${e.message}`);
   }
 
-  const startCmd = target 
-    ? `adb -s ${deviceId} shell am start -a android.intent.action.VIEW -d "${url}" ${target}`
-    : `adb -s ${deviceId} shell am start -a android.intent.action.VIEW -d "${url}"`;
+  const startArgs = target 
+    ? ['-s', deviceId, 'shell', 'am', 'start', '-a', 'android.intent.action.VIEW', '-d', url, target]
+    : ['-s', deviceId, 'shell', 'am', 'start', '-a', 'android.intent.action.VIEW', '-d', url];
     
-  console.log(`[openUrlRobust] Executing: ${startCmd}`);
+  console.log(`[openUrlRobust] Executing am start for ${deviceId}`);
   try {
-    const { stdout, stderr } = await execAsync(startCmd);
+    const { stdout, stderr } = await execFileAsync('adb', startArgs);
     console.log(`[openUrlRobust] Success: ${stdout} ${stderr}`);
   } catch (e: any) {
     console.error(`[openUrlRobust] Start failed. Exit code: ${e.code}, Stderr: ${e.stderr}, Error: ${e.message}`);
@@ -1058,6 +1058,9 @@ ipcMain.handle('install-apk', async (_event, deviceId, apkPath, sessionId?: stri
   if (!leaseGuard.allowed) {
     return { success: false, error: leaseGuard.error };
   }
+  if (!apkPath || typeof apkPath !== 'string' || !apkPath.toLowerCase().endsWith('.apk') || !fs.existsSync(apkPath)) {
+    return { success: false, error: 'Invalid or non-existent APK file path' };
+  }
   try {
     await client.getDevice(deviceId).install(apkPath);
     logAction(deviceId, `Installed APK: ${apkPath}`);
@@ -1083,9 +1086,14 @@ ipcMain.handle('export-config', async () => {
   if (canceled || !filePath) return { success: false };
   try {
     const devicesList = deviceStore.getAllDevices(false);
-    const exportMap: Record<string, DeviceData> = {};
+    const exportMap: Record<string, Partial<DeviceData>> = {};
     for (const d of devicesList) {
-      exportMap[d.id] = d;
+      exportMap[d.id] = {
+        customName: d.customName,
+        notes: d.notes,
+        tags: d.tags,
+        isBareBoard: d.isBareBoard
+      };
     }
     fs.writeFileSync(filePath, JSON.stringify(exportMap, null, 2));
     return { success: true, path: filePath };
@@ -1093,6 +1101,99 @@ ipcMain.handle('export-config', async () => {
     return { success: false, error: e.message };
   }
 });
+
+export function validateDeviceConfigImport(rawJson: unknown): {
+  valid: boolean;
+  error?: string;
+  sanitized?: Record<string, Partial<DeviceData>>;
+} {
+  if (typeof rawJson !== 'object' || rawJson === null || Array.isArray(rawJson)) {
+    return { valid: false, error: 'Import rejected: Configuration root must be a JSON object mapping device IDs to configuration.' };
+  }
+
+  const sanitized: Record<string, Partial<DeviceData>> = {};
+  const entries = Object.entries(rawJson);
+
+  if (entries.length === 0) {
+    return { valid: false, error: 'Import rejected: Configuration file contains no devices.' };
+  }
+
+  const existingDevices = new Set(deviceStore.getAllDevices(false).map(d => d.id));
+
+  for (const [id, patch] of entries) {
+    if (id === '__proto__' || id === 'constructor' || id === 'prototype') {
+      return { valid: false, error: `Import rejected: Prohibited property name '${id}'.` };
+    }
+
+    if (typeof id !== 'string' || id.trim().length === 0 || id.length > 128) {
+      return { valid: false, error: `Import rejected: Invalid device ID '${id}'.` };
+    }
+
+    if (!existingDevices.has(id)) {
+      return { valid: false, error: `Import rejected: Device '${id}' does not exist in the current device inventory.` };
+    }
+
+    if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+      return { valid: false, error: `Import rejected: Config for device '${id}' must be an object.` };
+    }
+
+    const cleanPatch: Partial<DeviceData> = {};
+    const allowedFields = new Set(['customName', 'notes', 'tags', 'isBareBoard']);
+
+    for (const [key, value] of Object.entries(patch)) {
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+        return { valid: false, error: `Import rejected: Prohibited property name '${key}' in device '${id}'.` };
+      }
+
+      if (!allowedFields.has(key)) {
+        return {
+          valid: false,
+          error: `Import rejected: Unauthorized or unknown field '${key}' in device '${id}'. Only user configuration (customName, notes, tags, isBareBoard) may be imported.`
+        };
+      }
+
+      if (key === 'customName') {
+        if (value !== undefined && typeof value !== 'string') {
+          return { valid: false, error: `Import rejected: 'customName' for '${id}' must be a string.` };
+        }
+        if (typeof value === 'string' && value.length > 100) {
+          return { valid: false, error: `Import rejected: 'customName' for '${id}' exceeds 100 characters.` };
+        }
+        cleanPatch.customName = value;
+      } else if (key === 'notes') {
+        if (value !== undefined && typeof value !== 'string') {
+          return { valid: false, error: `Import rejected: 'notes' for '${id}' must be a string.` };
+        }
+        if (typeof value === 'string' && value.length > 2000) {
+          return { valid: false, error: `Import rejected: 'notes' for '${id}' exceeds 2000 characters.` };
+        }
+        cleanPatch.notes = value;
+      } else if (key === 'tags') {
+        if (!Array.isArray(value)) {
+          return { valid: false, error: `Import rejected: 'tags' for '${id}' must be an array of strings.` };
+        }
+        if (value.length > 30) {
+          return { valid: false, error: `Import rejected: 'tags' for '${id}' exceeds maximum of 30 tags.` };
+        }
+        for (const tag of value) {
+          if (typeof tag !== 'string' || tag.length > 50) {
+            return { valid: false, error: `Import rejected: Each tag for '${id}' must be a string <= 50 characters.` };
+          }
+        }
+        cleanPatch.tags = value;
+      } else if (key === 'isBareBoard') {
+        if (typeof value !== 'boolean') {
+          return { valid: false, error: `Import rejected: 'isBareBoard' for '${id}' must be a boolean.` };
+        }
+        cleanPatch.isBareBoard = value;
+      }
+    }
+
+    sanitized[id] = cleanPatch;
+  }
+
+  return { valid: true, sanitized };
+}
 
 ipcMain.handle('import-config', async () => {
   if (!mainWindow) return { success: false, error: 'No main window' };
@@ -1103,8 +1204,20 @@ ipcMain.handle('import-config', async () => {
   });
   if (canceled || filePaths.length === 0) return { success: false };
   try {
-    const data: Record<string, Partial<DeviceData>> = JSON.parse(fs.readFileSync(filePaths[0], 'utf-8'));
-    for (const [id, patch] of Object.entries(data)) {
+    const rawContent = fs.readFileSync(filePaths[0], 'utf-8');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawContent);
+    } catch {
+      return { success: false, error: 'Invalid JSON file: parsing failed.' };
+    }
+
+    const validation = validateDeviceConfigImport(parsed);
+    if (!validation.valid || !validation.sanitized) {
+      return { success: false, error: validation.error };
+    }
+
+    for (const [id, patch] of Object.entries(validation.sanitized)) {
       deviceStore.updateDevice(id, patch);
       broadcastDelta(id, patch);
     }
@@ -1151,11 +1264,11 @@ ipcMain.handle('take-screenshot', async (_event, deviceId) => {
 
 // TODO(clipper-security-debt): bringClipperToFocus() visibly steals screen focus during every clipboard read on Android 10+ (API 29+). This is accepted as a temporary tradeoff.
 async function bringClipperToFocus(deviceId: string) {
-  await execAsync(`adb -s ${deviceId} shell am start -W -n ca.zgrs.clipper/.Main`).catch(() => {});
+  await execFileAsync('adb', ['-s', deviceId, 'shell', 'am', 'start', '-W', '-n', 'ca.zgrs.clipper/.Main']).catch(() => {});
   await new Promise(r => setTimeout(r, 350));
-  const { stdout } = await execAsync(`adb -s ${deviceId} shell dumpsys window`).catch(() => ({ stdout: '' }));
+  const { stdout } = await execFileAsync('adb', ['-s', deviceId, 'shell', 'dumpsys', 'window']).catch(() => ({ stdout: '' }));
   if (stdout.includes('DeprecatedTargetSdkVersionDialog')) {
-    await execAsync(`adb -s ${deviceId} shell input keyevent 4`).catch(() => {});
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'input', 'keyevent', '4']).catch(() => {});
     await new Promise(r => setTimeout(r, 250));
   }
 }
@@ -1169,16 +1282,16 @@ async function ensureClipperInstalled(deviceId: string) {
     if (!out.includes('package:')) {
       console.log(`[Clipper] Installing clipper.apk on ${deviceId} from ${clipperPath}...`);
       // TODO(clipper-security-debt): clipper.apk (majido/clipper, ca.zgrs.clipper) requires package_verifier_enable=0 and verifier_verify_adb_installs=0 to install (disabling Play Protect verification system-wide on the device, not just for this app). This is accepted as a temporary tradeoff.
-      await execAsync(`adb -s ${deviceId} shell settings put global verifier_verify_adb_installs 0`).catch(() => {});
-      await execAsync(`adb -s ${deviceId} shell settings put global package_verifier_enable 0`).catch(() => {});
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'global', 'verifier_verify_adb_installs', '0']).catch(() => {});
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'global', 'package_verifier_enable', '0']).catch(() => {});
       try {
-        await execAsync(`adb -s ${deviceId} install -r -d -g --bypass-low-target-sdk-block "${clipperPath}"`);
+        await execFileAsync('adb', ['-s', deviceId, 'install', '-r', '-d', '-g', '--bypass-low-target-sdk-block', clipperPath]);
       } catch {
         await client.getDevice(deviceId).install(clipperPath);
       }
       // Launch once to move package out of stopped state, then dismiss
       await bringClipperToFocus(deviceId);
-      await execAsync(`adb -s ${deviceId} shell input keyevent 4`).catch(() => {});
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'input', 'keyevent', '4']).catch(() => {});
     }
   } catch (err: any) {
     console.warn(`[Clipper] Auto-install check failed for ${deviceId}:`, err?.message || err);
@@ -1193,8 +1306,11 @@ ipcMain.handle('sync-clipboard', async (_event, deviceId, direction, text, sessi
   try {
     await ensureClipperInstalled(deviceId);
     if (direction === 'toDevice') {
-      const sanitized = sanitizeFreeText(text || '');
-      await client.getDevice(deviceId).shell(`am broadcast -a clipper.set -n ca.zgrs.clipper/.ClipperReceiver -e text "${sanitized}"`);
+      const b64 = Buffer.from(text || '', 'utf-8').toString('base64');
+      await execFileAsync('adb', [
+        '-s', deviceId, 'shell',
+        `RAW=$(echo ${b64} | base64 -d); am broadcast -a clipper.set -n ca.zgrs.clipper/.ClipperReceiver --es text "$RAW"`
+      ]);
       logAction(deviceId, 'Synced clipboard to device');
       return { success: true };
     } else if (direction === 'fromDevice') {
@@ -1207,7 +1323,7 @@ ipcMain.handle('sync-clipboard', async (_event, deviceId, direction, text, sessi
       const output = buffer.toString();
 
       // Send KEYCODE_BACK to return to the previous screen
-      await client.getDevice(deviceId).shell('input keyevent 4').catch(() => {});
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'input', 'keyevent', '4']).catch(() => {});
 
       console.log(`[IPC] Broadcast output:`, output);
       const match = output.match(/data="(.*)"/s);
@@ -1235,13 +1351,13 @@ ipcMain.handle('switch-to-wireless', async (_event, deviceId, sessionId?: string
   }
   try {
     // 1. Restart ADB in TCP/IP mode on port 5555
-    await execAsync(`adb -s ${deviceId} tcpip 5555`);
+    await execFileAsync('adb', ['-s', deviceId, 'tcpip', '5555']);
     
     // Wait a brief moment for the adbd daemon on device to restart in tcpip mode
     await new Promise(res => setTimeout(res, 2000));
     
     // 2. Fetch the device's IP address (wlan0)
-    const { stdout } = await execAsync(`adb -s ${deviceId} shell ip route`);
+    const { stdout } = await execFileAsync('adb', ['-s', deviceId, 'shell', 'ip', 'route']);
     // Output looks like: "192.168.1.0/24 dev wlan0 proto kernel scope link src 192.168.1.10"
     const match = stdout.match(/src (\d+\.\d+\.\d+\.\d+)/);
     
@@ -1250,9 +1366,12 @@ ipcMain.handle('switch-to-wireless', async (_event, deviceId, sessionId?: string
     }
     
     const ip = match[1];
+    if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) {
+      return { success: false, error: 'Invalid IP address detected from device route' };
+    }
     
     // 3. Connect to the device via its IP
-    const { stdout: connectOutput } = await execAsync(`adb connect ${ip}:5555`);
+    const { stdout: connectOutput } = await execFileAsync('adb', ['connect', `${ip}:5555`]);
     
     if (connectOutput.includes('failed') || connectOutput.includes('cannot connect')) {
       return { success: false, error: `Failed to connect to ${ip}:5555` };
@@ -1292,8 +1411,11 @@ ipcMain.handle('send-text', async (_event, deviceId, text, sessionId?: string) =
     return { success: false, error: leaseGuard.error };
   }
   try {
-    const sanitized = sanitizeFreeText(text);
-    await client.getDevice(deviceId).shell(`input text "${sanitized}"`);
+    const b64 = Buffer.from(text || '', 'utf-8').toString('base64');
+    await execFileAsync('adb', [
+      '-s', deviceId, 'shell',
+      `RAW=$(echo ${b64} | base64 -d); input text "$RAW"`
+    ]);
     logAction(deviceId, `Sent text: ${text}`);
     return { success: true };
   } catch (e: any) {
@@ -1306,6 +1428,12 @@ ipcMain.handle('push-file', async (_event, deviceId, localPath, remotePath, sess
   if (!leaseGuard.allowed) {
     return { success: false, error: leaseGuard.error };
   }
+  if (!localPath || typeof localPath !== 'string' || !fs.existsSync(localPath)) {
+    return { success: false, error: 'Local file does not exist' };
+  }
+  if (!remotePath || typeof remotePath !== 'string' || !remotePath.startsWith('/')) {
+    return { success: false, error: 'Remote path must be an absolute Android path starting with /' };
+  }
   try {
     await client.getDevice(deviceId).push(localPath, remotePath);
     logAction(deviceId, `Pushed file to ${remotePath}`);
@@ -1316,6 +1444,12 @@ ipcMain.handle('push-file', async (_event, deviceId, localPath, remotePath, sess
 });
 
 ipcMain.handle('pull-file', async (_event, deviceId, remotePath, localPath) => {
+  if (!remotePath || typeof remotePath !== 'string' || !remotePath.startsWith('/')) {
+    return { success: false, error: 'Remote path must be an absolute Android path starting with /' };
+  }
+  if (!localPath || typeof localPath !== 'string') {
+    return { success: false, error: 'Invalid destination file path' };
+  }
   try {
     const transfer = await client.getDevice(deviceId).pull(remotePath);
     return new Promise((resolve) => {
@@ -1337,7 +1471,7 @@ ipcMain.handle('launch-app', async (_event, deviceId, packageName) => {
     if (!isValidPackageName(packageName)) {
       return { success: false, error: 'Invalid package name format' };
     }
-    await client.getDevice(deviceId).shell(`monkey -p ${packageName} -c android.intent.category.LAUNCHER 1`);
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'monkey', '-p', packageName, '-c', 'android.intent.category.LAUNCHER', '1']);
     logAction(deviceId, `Launched app: ${packageName}`);
     return { success: true };
   } catch (e: any) {
@@ -1354,7 +1488,7 @@ ipcMain.handle('clear-app-cache', async (_event, deviceId, packageName, sessionI
     if (!isValidPackageName(packageName)) {
       return { success: false, error: 'Invalid package name format' };
     }
-    await client.getDevice(deviceId).shell(`pm clear ${packageName}`);
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'pm', 'clear', packageName]);
     logAction(deviceId, `Cleared cache for: ${packageName}`);
     return { success: true };
   } catch (e: any) {
@@ -1371,15 +1505,60 @@ ipcMain.handle('check-adb-status', async () => {
   }
 });
 
+let expertModeEnabled = false;
+
+// Typed allowlist of safe diagnostic commands when expert mode is OFF
+const SAFE_COMMAND_ALLOWLIST: RegExp[] = [
+  /^getprop(\s+[a-zA-Z0-9._-]+)?$/,
+  /^dumpsys\s+(battery|batteryinfo|package|window|display|power|diskstats|meminfo)(\s+[a-zA-Z0-9._-]+)?$/,
+  /^pm\s+list\s+(packages|features|permission-groups)(\s+-[a-zA-Z0-9]+)?$/,
+  /^pm\s+path\s+[a-zA-Z0-9._-]+$/,
+  /^ip\s+(addr|route|neigh)(\s+show)?$/,
+  /^cat\s+\/proc\/(cpuinfo|meminfo|version|uptime|loadavg)$/,
+  /^uptime$/,
+  /^date$/,
+  /^df(\s+-[a-zA-Z]+)?(\s+\/[a-zA-Z0-9._-]+)*$/,
+  /^free(\s+-[a-zA-Z]+)?$/,
+  /^wm\s+(size|density)$/,
+  /^settings\s+get\s+(system|secure|global)\s+[a-zA-Z0-9_]+$/,
+  /^logcat\s+-d(\s+-[a-zA-Z0-9]+)*(\s+[a-zA-Z0-9_:]+)*$/,
+  /^ifconfig(\s+[a-zA-Z0-9]+)?$/
+];
+
+export function isSafeAdbCommand(cmd: string): boolean {
+  const trimmed = cmd.trim();
+  // Disallow shell chaining operators even if they appear inside arguments
+  if (/[;&|`$]/.test(trimmed)) {
+    return false;
+  }
+  return SAFE_COMMAND_ALLOWLIST.some(pattern => pattern.test(trimmed));
+}
+
+ipcMain.handle('get-expert-mode', () => expertModeEnabled);
+ipcMain.handle('set-expert-mode', (_event, enabled: boolean) => {
+  expertModeEnabled = Boolean(enabled);
+  return { success: true, expertMode: expertModeEnabled };
+});
+
 ipcMain.handle('run-adb-command', async (_event, deviceId, command, sessionId?: string) => {
   const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
   if (!leaseGuard.allowed) {
     return { success: false, error: leaseGuard.error };
   }
+  const trimmed = (command || '').trim();
+  if (!trimmed) {
+    return { success: false, error: 'Command cannot be empty' };
+  }
+  if (!expertModeEnabled && !isSafeAdbCommand(trimmed)) {
+    return {
+      success: false,
+      error: 'Command blocked: Expert Mode is disabled. Only allowlisted diagnostic commands (getprop, dumpsys, pm list, ip, etc.) are allowed.'
+    };
+  }
   try {
-    const stream = await client.getDevice(deviceId).shell(command);
+    const stream = await client.getDevice(deviceId).shell(trimmed);
     const output = await Adb.util.readAll(stream);
-    logAction(deviceId, `Ran command: ${command}`);
+    logAction(deviceId, `Ran command: ${trimmed}`);
     return { success: true, output: output.toString() };
   } catch (e: any) {
     return { success: false, error: e.message };
@@ -1392,7 +1571,8 @@ ipcMain.handle('open-settings', async (_event, deviceId, intent) => {
     if (intent === 'wifi') action = 'android.settings.WIFI_SETTINGS';
     if (intent === 'ime') action = 'android.settings.INPUT_METHOD_SETTINGS';
     if (intent === 'accessibility') action = 'android.settings.ACCESSIBILITY_SETTINGS';
-    await client.getDevice(deviceId).shell(`am start -a ${action}`);
+    if (!action) return { success: false, error: 'Invalid settings intent' };
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'am', 'start', '-a', action]);
     logAction(deviceId, `Opened settings: ${intent}`);
     return { success: true };
   } catch (e: any) {
@@ -1403,9 +1583,9 @@ ipcMain.handle('open-settings', async (_event, deviceId, intent) => {
 ipcMain.handle('locate-device', async (_event, deviceId) => {
   try {
     // Wake screen
-    await execAsync(`adb -s ${deviceId} shell input keyevent 224`).catch(() => {});
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'input', 'keyevent', '224']).catch(() => {});
     // Vibrate for 1 second
-    await execAsync(`adb -s ${deviceId} shell cmd vibrator vibrate 1000`).catch(() => {});
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'cmd', 'vibrator', 'vibrate', '1000']).catch(() => {});
     // Flash bright red color using browser VIEW intent
     const dataUri = 'data:text/html,%3Chtml%3E%3Cbody%20style=%22background:red;%22%3E%3C/body%3E%3C/html%3E';
     await openUrlRobust(deviceId, dataUri).catch((e) => {
@@ -1418,6 +1598,25 @@ ipcMain.handle('locate-device', async (_event, deviceId) => {
   }
 });
 
+export function redactLogcatText(text: string): string {
+  if (!text) return text;
+  let redacted = text;
+  // 1. JWT tokens
+  redacted = redacted.replace(/eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+/g, '[REDACTED_JWT]');
+  // 2. Authorization headers (Bearer / Basic / Token)
+  redacted = redacted.replace(/(authorization\s*:\s*(?:bearer|basic|token)\s+)[^\s\r\n]+/gi, '$1[REDACTED]');
+  // 3. Key-value secrets (password, secret, apiKey, token, etc.)
+  redacted = redacted.replace(
+    /(["']?(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|session[_-]?id|private[_-]?key)["']?\s*[:=]\s*["']?)[^\s"',;&}]+/gi,
+    '$1[REDACTED]'
+  );
+  // 4. Basic Auth credentials in URLs
+  redacted = redacted.replace(/(https?:\/\/)([^:\/\s]+):([^@\/\s]+)@/g, '$1[USER]:[REDACTED]@');
+  // 5. PEM private keys
+  redacted = redacted.replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]');
+  return redacted;
+}
+
 const activeLogcats = new Map<string, ChildProcess>();
 ipcMain.handle('start-logcat', async (event, deviceId) => {
   try {
@@ -1426,10 +1625,12 @@ ipcMain.handle('start-logcat', async (event, deviceId) => {
     }
     const proc = spawn('adb', ['-s', deviceId, 'logcat', '-v', 'time']);
     proc.stdout?.on('data', (data: any) => {
-       event.sender.send(`logcat-data-${deviceId}`, data.toString());
+       const cleaned = redactLogcatText(data.toString());
+       event.sender.send(`logcat-data-${deviceId}`, cleaned);
     });
     proc.stderr?.on('data', (data: any) => {
-       event.sender.send(`logcat-data-${deviceId}`, data.toString());
+       const cleaned = redactLogcatText(data.toString());
+       event.sender.send(`logcat-data-${deviceId}`, cleaned);
     });
     activeLogcats.set(deviceId, proc);
     return { success: true };
@@ -1495,7 +1696,7 @@ ipcMain.handle('get-test-account-password', async (_event, accountId) => {
 
 ipcMain.handle('scan-mdns', async () => {
   try {
-    const { stdout } = await execAsync('adb mdns services');
+    const { stdout } = await execFileAsync('adb', ['mdns', 'services']);
     const lines = stdout.split('\n').map(l => l.trim()).filter(l => l);
     const discovered: { name: string; ip: string; serial?: string }[] = [];
     
@@ -1515,7 +1716,11 @@ ipcMain.handle('scan-mdns', async () => {
 
 ipcMain.handle('connect-ip', async (_event, ip) => {
   try {
-    const { stdout } = await execAsync(`adb connect ${ip}`);
+    const trimmed = (ip || '').trim();
+    if (!/^([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]{1,5})?$/.test(trimmed)) {
+      return { success: false, error: 'Invalid IP address format. Expected IPv4 or IPv4:port.' };
+    }
+    const { stdout } = await execFileAsync('adb', ['connect', trimmed]);
     if (stdout.includes('failed') || stdout.includes('cannot connect')) {
       return { success: false, error: stdout };
     }

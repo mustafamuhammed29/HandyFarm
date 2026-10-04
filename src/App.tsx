@@ -76,6 +76,7 @@ function App() {
   const [activeTagFilter, setActiveTagFilter] = useState('');
   const [allTags, setAllTags] = useState<string[]>([]);
   const [showAdbConsole, setShowAdbConsole] = useState(false);
+  const [expertMode, setExpertMode] = useState(false);
   const [adbCommand, setAdbCommand] = useState('');
   const [adbOutput, setAdbOutput] = useState('');
   const [batchDelay, setBatchDelay] = useState(0);
@@ -503,6 +504,18 @@ function App() {
   const handleImport = async () => {
     const res = await window.electronAPI.importConfig();
     if (res.success) setGlobalMessage(`Import successful!`);
+  };
+
+  useEffect(() => {
+    if (showAdbConsole) {
+      window.electronAPI.getExpertMode?.().then(em => setExpertMode(Boolean(em)));
+    }
+  }, [showAdbConsole]);
+
+  const toggleExpertMode = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const enabled = e.target.checked;
+    const res = await window.electronAPI.setExpertMode?.(enabled);
+    if (res?.success) setExpertMode(res.expertMode);
   };
 
   const runAdbCommand = async () => {
@@ -1133,6 +1146,15 @@ function App() {
           <div className="modal-content" onClick={e => e.stopPropagation()} style={{ width: '600px', maxWidth: '90vw' }}>
             <h3>ADB Console: {focusedDeviceId}</h3>
             <div style={{ padding: '16px', background: 'var(--bg-color)', display: 'flex', flexDirection: 'column', gap: '8px', borderRadius: '8px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '12px', color: 'var(--text-muted)' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={expertMode} onChange={toggleExpertMode} />
+                  <span>Expert Mode (Allow non-allowlist commands)</span>
+                </label>
+                <span style={{ color: expertMode ? 'var(--status-offline)' : 'var(--status-online)', fontWeight: '500' }}>
+                  {expertMode ? '⚠️ Expert Mode Active' : '🔒 Allowlist Only'}
+                </span>
+              </div>
               <div style={{display: 'flex', gap: '8px'}}>
                 <span style={{fontFamily: 'monospace', color: 'var(--accent)', alignSelf: 'center'}}>$</span>
                 <input 
@@ -1140,7 +1162,7 @@ function App() {
                   value={adbCommand}
                   onChange={e => setAdbCommand(e.target.value)}
                   onKeyDown={e => e.key === 'Enter' && runAdbCommand()}
-                  placeholder="adb shell command..."
+                  placeholder={expertMode ? "adb shell command..." : "getprop, dumpsys, pm list, ip, uptime, etc."}
                   style={{flex: 1, padding: '8px', background: 'var(--card-bg)', color: 'var(--text-main)', border: '1px solid var(--border)', borderRadius: '4px', fontFamily: 'monospace'}}
                 />
                 <button className="large-btn primary" style={{padding: '8px 16px', fontSize: '14px'}} onClick={runAdbCommand}>Run</button>

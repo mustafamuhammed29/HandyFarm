@@ -98,6 +98,8 @@ declare global {
       releaseLease?: (physicalDeviceId: string, sessionId: string) => Promise<{ success: boolean; error?: string }>;
       heartbeatLease?: (physicalDeviceId: string, sessionId: string, extensionMinutes?: number) => Promise<{ success: boolean; error?: string; leaseExpiresAt?: number }>;
       setDeviceLeaseState?: (physicalDeviceId: string, state: LeaseState, sessionId?: string) => Promise<{ success: boolean; error?: string }>;
+      getExpertMode?: () => Promise<boolean>;
+      setExpertMode?: (enabled: boolean) => Promise<{ success: boolean; expertMode: boolean }>;
     };
   }
 }
