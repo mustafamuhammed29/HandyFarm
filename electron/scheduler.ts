@@ -118,6 +118,25 @@ export class Scheduler {
   }
 
   /**
+   * Update the global concurrency cap at runtime. Used by the Phase 4 adaptive
+   * cap to lower concurrency as the host USB bandwidth budget saturates. The cap
+   * is never allowed to drop below 1; in-flight jobs are not interrupted.
+   */
+  setConcurrencyCap(cap: number): void {
+    if (!Number.isFinite(cap)) {
+      throw new Error('cap must be a finite number');
+    }
+    const bounded = Math.max(1, Math.floor(cap));
+    this.opts.globalConcurrencyCap = bounded;
+    // Drain any newly-eligible queued work.
+    this.tryDispatch();
+  }
+
+  getConcurrencyCap(): number {
+    return this.opts.globalConcurrencyCap;
+  }
+
+  /**
    * Submit a job. Returns immediately with the assigned jobId and a live audit entry.
    * The audit entry's status transitions queued → running → completed/failed/cancelled.
    */

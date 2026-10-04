@@ -162,6 +162,19 @@ export class DeviceStore {
   private stmtGetEgressHistory!: Database.Statement;
   private stmtGetLatestEgress!: Database.Statement;
 
+  // Phase 4: scheduler audit log + per-device health counters.
+  private stmtInsertAudit!: Database.Statement;
+  private stmtGetAuditForDevice!: Database.Statement;
+  private stmtGetAllPhysicalDeviceHealth!: Database.Statement;
+  private stmtGetPhysicalDeviceHealth!: Database.Statement;
+  private stmtUpdateHealth!: Database.Statement;
+  private stmtUpsertHealthCounters!: Database.Statement;
+  private stmtPruneOldAudit!: Database.Statement;
+  private stmtIncrementPropsAttempts!: Database.Statement;
+  private stmtIncrementPropsFailures!: Database.Statement;
+  private stmtIncrementReconnect!: Database.Statement;
+  private stmtResetHealthCountersIfStale!: Database.Statement;
+
   constructor(dbPath: string, jsonBackupPath?: string) {
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) {
@@ -287,7 +300,52 @@ export class DeviceStore {
       CREATE INDEX IF NOT EXISTS idx_egress_device_time ON egress_history(device_id, observed_at DESC);
       CREATE INDEX IF NOT EXISTS idx_egress_phys_time ON egress_history(physical_device_id, observed_at DESC);
       CREATE INDEX IF NOT EXISTS idx_egress_run_id ON egress_history(run_id);
+
+      -- Phase 4: scheduler audit log persisted across restarts so health scoring can
+      -- measure flakiness from real test runs even after a host reboot. Read by
+      -- electron/health.ts on a sliding window (default 30 min).
+      CREATE TABLE IF NOT EXISTS scheduler_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        run_id TEXT,
+        group_id TEXT,
+        device_id TEXT,
+        physical_device_id TEXT,
+        label TEXT,
+        priority INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        scheduled_at INTEGER NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER,
+        applied_delay_ms INTEGER NOT NULL DEFAULT 0,
+        order_index INTEGER NOT NULL,
+        error TEXT,
+        result_json TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_audit_device_time ON scheduler_audit(device_id, completed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_audit_phys_time ON scheduler_audit(physical_device_id, completed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_audit_run_id ON scheduler_audit(run_id);
+      CREATE INDEX IF NOT EXISTS idx_audit_status_time ON scheduler_audit(status, completed_at DESC);
     `);
+
+    // Phase 4: health-tracking columns on physical_devices (per-machine state, not per-transport).
+    const pdCols = this.db.pragma('table_info(physical_devices)') as any[];
+    const addPdColumn = (col: string, defSql: string) => {
+      if (!pdCols.some(c => c.name === col)) {
+        this.db.exec(`ALTER TABLE physical_devices ADD COLUMN ${col} ${defSql};`);
+      }
+    };
+    addPdColumn('health_score',            'INTEGER DEFAULT 100');
+    addPdColumn('health_reasons_json',     "TEXT DEFAULT '[]'");
+    addPdColumn('health_last_evaluated_at','INTEGER DEFAULT 0');
+    addPdColumn('props_attempts',          'INTEGER DEFAULT 0');
+    addPdColumn('props_failures',          'INTEGER DEFAULT 0');
+    addPdColumn('props_window_started_at',  'INTEGER DEFAULT 0');
+    addPdColumn('reconnect_count',         'INTEGER DEFAULT 0');
+    addPdColumn('reconnect_window_started_at', 'INTEGER DEFAULT 0');
+    addPdColumn('reboot_count',            'INTEGER DEFAULT 0');
+    addPdColumn('audit_window_started_at', 'INTEGER DEFAULT 0');
+    addPdColumn('last_status_change_at',   'INTEGER DEFAULT 0');
 
     // Ensure physical_device_id column exists if table was created in an earlier migration
     const cols = this.db.pragma('table_info(devices)') as any[];
@@ -487,6 +545,134 @@ export class DeviceStore {
     `);
     this.stmtGetLatestEgress = this.db.prepare(`
       SELECT * FROM egress_history WHERE device_id = ? OR physical_device_id = ? ORDER BY observed_at DESC LIMIT 1
+    `);
+
+    // Phase 4: scheduler audit log. Persisted across restarts so health scoring can
+    // measure flakiness from real test runs even after a host reboot. The audit
+    // log is append-only; pruning happens on a long-retention window (24h).
+    this.stmtInsertAudit = this.db.prepare(`
+      INSERT INTO scheduler_audit (
+        job_id, run_id, group_id, device_id, physical_device_id, label, priority,
+        status, scheduled_at, started_at, completed_at, applied_delay_ms,
+        order_index, error, result_json
+      ) VALUES (
+        @jobId, @runId, @groupId, @deviceId, @physicalDeviceId, @label, @priority,
+        @status, @scheduledAt, @startedAt, @completedAt, @appliedDelayMs,
+        @orderIndex, @error, @resultJson
+      )
+    `);
+    this.stmtGetAuditForDevice = this.db.prepare(`
+      SELECT * FROM scheduler_audit
+      WHERE (device_id = ? OR physical_device_id = ?)
+        AND completed_at IS NOT NULL
+        AND completed_at >= ?
+      ORDER BY completed_at DESC
+    `);
+    this.stmtGetAllPhysicalDeviceHealth = this.db.prepare(`
+      SELECT
+        physical_device_id,
+        health_score,
+        health_reasons_json,
+        health_last_evaluated_at,
+        props_attempts,
+        props_failures,
+        props_window_started_at,
+        reconnect_count,
+        reconnect_window_started_at,
+        reboot_count,
+        audit_window_started_at,
+        last_status_change_at
+      FROM physical_devices
+    `);
+    this.stmtGetPhysicalDeviceHealth = this.db.prepare(`
+      SELECT
+        physical_device_id,
+        health_score,
+        health_reasons_json,
+        health_last_evaluated_at,
+        props_attempts,
+        props_failures,
+        props_window_started_at,
+        reconnect_count,
+        reconnect_window_started_at,
+        reboot_count,
+        audit_window_started_at,
+        last_status_change_at
+      FROM physical_devices
+      WHERE physical_device_id = ?
+    `);
+    this.stmtUpdateHealth = this.db.prepare(`
+      UPDATE physical_devices SET
+        health_score = @healthScore,
+        health_reasons_json = @healthReasonsJson,
+        health_last_evaluated_at = @healthLastEvaluatedAt,
+        updated_at = @updatedAt
+      WHERE physical_device_id = @physicalDeviceId
+    `);
+    this.stmtUpsertHealthCounters = this.db.prepare(`
+      INSERT INTO physical_devices (
+        physical_device_id, current_transport_id, last_seen_transport_id, serials, updated_at,
+        health_score, health_reasons_json, health_last_evaluated_at,
+        props_attempts, props_failures, props_window_started_at,
+        reconnect_count, reconnect_window_started_at,
+        reboot_count, audit_window_started_at, last_status_change_at
+      ) VALUES (
+        @physicalDeviceId, @currentTransportId, @lastSeenTransportId, @serials, @updatedAt,
+        @healthScore, @healthReasonsJson, @healthLastEvaluatedAt,
+        @propsAttempts, @propsFailures, @propsWindowStartedAt,
+        @reconnectCount, @reconnectWindowStartedAt,
+        @rebootCount, @auditWindowStartedAt, @lastStatusChangeAt
+      )
+      ON CONFLICT(physical_device_id) DO UPDATE SET
+        health_score = excluded.health_score,
+        health_reasons_json = excluded.health_reasons_json,
+        health_last_evaluated_at = excluded.health_last_evaluated_at,
+        props_attempts = excluded.props_attempts,
+        props_failures = excluded.props_failures,
+        props_window_started_at = excluded.props_window_started_at,
+        reconnect_count = excluded.reconnect_count,
+        reconnect_window_started_at = excluded.reconnect_window_started_at,
+        reboot_count = excluded.reboot_count,
+        audit_window_started_at = excluded.audit_window_started_at,
+        last_status_change_at = excluded.last_status_change_at,
+        updated_at = excluded.updated_at
+    `);
+    this.stmtPruneOldAudit = this.db.prepare(`
+      DELETE FROM scheduler_audit WHERE completed_at IS NOT NULL AND completed_at < ?
+    `);
+    this.stmtIncrementPropsAttempts = this.db.prepare(`
+      UPDATE physical_devices SET
+        props_attempts = props_attempts + 1,
+        props_window_started_at = CASE WHEN props_window_started_at = 0 THEN ? ELSE props_window_started_at END,
+        updated_at = ?
+      WHERE physical_device_id = ?
+    `);
+    this.stmtIncrementPropsFailures = this.db.prepare(`
+      UPDATE physical_devices SET
+        props_attempts = props_attempts + 1,
+        props_failures = props_failures + 1,
+        props_window_started_at = CASE WHEN props_window_started_at = 0 THEN ? ELSE props_window_started_at END,
+        updated_at = ?
+      WHERE physical_device_id = ?
+    `);
+    this.stmtIncrementReconnect = this.db.prepare(`
+      UPDATE physical_devices SET
+        reconnect_count = reconnect_count + 1,
+        reconnect_window_started_at = CASE WHEN reconnect_window_started_at = 0 THEN ? ELSE reconnect_window_started_at END,
+        last_status_change_at = ?,
+        updated_at = ?
+      WHERE physical_device_id = ?
+    `);
+    this.stmtResetHealthCountersIfStale = this.db.prepare(`
+      UPDATE physical_devices SET
+        props_attempts = CASE WHEN props_window_started_at = 0 OR @sinceMs - props_window_started_at >= @windowMs THEN @resetValue ELSE props_attempts END,
+        props_failures = CASE WHEN props_window_started_at = 0 OR @sinceMs - props_window_started_at >= @windowMs THEN @resetValue ELSE props_failures END,
+        props_window_started_at = CASE WHEN props_window_started_at = 0 OR @sinceMs - props_window_started_at >= @windowMs THEN @sinceMs ELSE props_window_started_at END,
+        reconnect_count = CASE WHEN reconnect_window_started_at = 0 OR @sinceMs - reconnect_window_started_at >= @windowMs THEN @resetValue ELSE reconnect_count END,
+        reconnect_window_started_at = CASE WHEN reconnect_window_started_at = 0 OR @sinceMs - reconnect_window_started_at >= @windowMs THEN @sinceMs ELSE reconnect_window_started_at END,
+        audit_window_started_at = CASE WHEN audit_window_started_at = 0 THEN @sinceMs ELSE audit_window_started_at END,
+        updated_at = @sinceMs
+      WHERE physical_device_id = @physicalDeviceId
     `);
   }
 
@@ -1563,6 +1749,311 @@ export class DeviceStore {
       };
     } catch {
       return undefined;
+    }
+  }
+
+  // --- Phase 4: scheduler audit + per-device health counters ---
+
+  insertAuditEntry(entry: {
+    jobId: string;
+    runId?: string;
+    groupId?: string;
+    deviceId?: string;
+    physicalDeviceId?: string;
+    label?: string;
+    priority: number;
+    status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+    scheduledAt: number;
+    startedAt?: number;
+    completedAt?: number;
+    appliedDelayMs: number;
+    orderIndex: number;
+    error?: string;
+    result?: unknown;
+  }): void {
+    try {
+      this.stmtInsertAudit.run({
+        jobId: entry.jobId,
+        runId: entry.runId ?? null,
+        groupId: entry.groupId ?? null,
+        deviceId: entry.deviceId ?? null,
+        physicalDeviceId: entry.physicalDeviceId ?? null,
+        label: entry.label ?? null,
+        priority: entry.priority,
+        status: entry.status,
+        scheduledAt: entry.scheduledAt,
+        startedAt: entry.startedAt ?? null,
+        completedAt: entry.completedAt ?? null,
+        appliedDelayMs: entry.appliedDelayMs,
+        orderIndex: entry.orderIndex,
+        error: entry.error ?? null,
+        resultJson: entry.result !== undefined ? JSON.stringify(entry.result) : null,
+      });
+    } catch (err) {
+      console.warn(`[DeviceStore] Failed to persist audit entry ${entry.jobId}:`, err);
+    }
+  }
+
+  /**
+   * Sliding-window audit lookup for the health monitor. Returns rows with
+   * non-null `completedAt` at or after `sinceMs`. The caller is responsible for
+   * applying additional filters (e.g. only-failed, only-this-run).
+   */
+  getAuditForDevice(deviceIdOrPhysId: string, sinceMs: number): Array<{
+    jobId: string;
+    runId?: string | null;
+    groupId?: string | null;
+    deviceId?: string | null;
+    physicalDeviceId?: string | null;
+    label?: string | null;
+    priority: number;
+    status: string;
+    scheduledAt: number;
+    startedAt?: number | null;
+    completedAt?: number | null;
+    appliedDelayMs: number;
+    orderIndex: number;
+    error?: string | null;
+  }> {
+    try {
+      const rows = this.stmtGetAuditForDevice.all(deviceIdOrPhysId, deviceIdOrPhysId, sinceMs) as any[];
+      return rows.map(r => ({
+        jobId: r.job_id,
+        runId: r.run_id,
+        groupId: r.group_id,
+        deviceId: r.device_id,
+        physicalDeviceId: r.physical_device_id,
+        label: r.label,
+        priority: r.priority,
+        status: r.status,
+        scheduledAt: r.scheduled_at,
+        startedAt: r.started_at,
+        completedAt: r.completed_at,
+        appliedDelayMs: r.applied_delay_ms,
+        orderIndex: r.order_index,
+        error: r.error,
+      }));
+    } catch (err) {
+      console.warn(`[DeviceStore] Failed to load audit for ${deviceIdOrPhysId}:`, err);
+      return [];
+    }
+  }
+
+  pruneOldAudit(olderThanMs: number): number {
+    try {
+      const res = this.stmtPruneOldAudit.run(olderThanMs);
+      return res.changes;
+    } catch (err) {
+      console.warn('[DeviceStore] Failed to prune old audit entries:', err);
+      return 0;
+    }
+  }
+
+  /**
+   * Read the health counters for a single physical device. Returns a fresh
+   * default if the row doesn't exist yet (freshly-seen device, no health yet).
+   */
+  getPhysicalDeviceHealth(physicalDeviceId: string): {
+    physicalDeviceId: string;
+    healthScore: number;
+    healthReasonsJson: string;
+    healthLastEvaluatedAt: number;
+    propsAttempts: number;
+    propsFailures: number;
+    propsWindowStartedAt: number;
+    reconnectCount: number;
+    reconnectWindowStartedAt: number;
+    rebootCount: number;
+    auditWindowStartedAt: number;
+    lastStatusChangeAt: number;
+  } {
+    const row = this.stmtGetPhysicalDeviceHealth.get(physicalDeviceId) as any;
+    if (!row) {
+      return {
+        physicalDeviceId,
+        healthScore: 100,
+        healthReasonsJson: '[]',
+        healthLastEvaluatedAt: 0,
+        propsAttempts: 0,
+        propsFailures: 0,
+        propsWindowStartedAt: 0,
+        reconnectCount: 0,
+        reconnectWindowStartedAt: 0,
+        rebootCount: 0,
+        auditWindowStartedAt: 0,
+        lastStatusChangeAt: 0,
+      };
+    }
+    return {
+      physicalDeviceId: row.physical_device_id,
+      healthScore: row.health_score ?? 100,
+      healthReasonsJson: row.health_reasons_json ?? '[]',
+      healthLastEvaluatedAt: row.health_last_evaluated_at ?? 0,
+      propsAttempts: row.props_attempts ?? 0,
+      propsFailures: row.props_failures ?? 0,
+      propsWindowStartedAt: row.props_window_started_at ?? 0,
+      reconnectCount: row.reconnect_count ?? 0,
+      reconnectWindowStartedAt: row.reconnect_window_started_at ?? 0,
+      rebootCount: row.reboot_count ?? 0,
+      auditWindowStartedAt: row.audit_window_started_at ?? 0,
+      lastStatusChangeAt: row.last_status_change_at ?? 0,
+    };
+  }
+
+  /**
+   * Get the fleet-level health snapshot for every known physical device. Used by
+   * the fleet-level view and the health monitor's per-tick evaluation pass.
+   */
+  getAllPhysicalDeviceHealth(): Array<ReturnType<DeviceStore['getPhysicalDeviceHealth']>> {
+    try {
+      const rows = this.stmtGetAllPhysicalDeviceHealth.all() as any[];
+      return rows.map(r => ({
+        physicalDeviceId: r.physical_device_id,
+        healthScore: r.health_score ?? 100,
+        healthReasonsJson: r.health_reasons_json ?? '[]',
+        healthLastEvaluatedAt: r.health_last_evaluated_at ?? 0,
+        propsAttempts: r.props_attempts ?? 0,
+        propsFailures: r.props_failures ?? 0,
+        propsWindowStartedAt: r.props_window_started_at ?? 0,
+        reconnectCount: r.reconnect_count ?? 0,
+        reconnectWindowStartedAt: r.reconnect_window_started_at ?? 0,
+        rebootCount: r.reboot_count ?? 0,
+        auditWindowStartedAt: r.audit_window_started_at ?? 0,
+        lastStatusChangeAt: r.last_status_change_at ?? 0,
+      }));
+    } catch (err) {
+      console.warn('[DeviceStore] Failed to load fleet health snapshot:', err);
+      return [];
+    }
+  }
+
+  /**
+   * Persist the computed health score + reasons for a device. Used after
+   * `computeHealthScore` + `transitionHealth` resolve to a new score.
+   */
+  savePhysicalDeviceHealth(input: {
+    physicalDeviceId: string;
+    healthScore: number;
+    healthReasons: string[];
+    healthLastEvaluatedAt: number;
+  }): void {
+    try {
+      // For an existing row: only update the score/reasons/timestamp columns.
+      // For a brand-new row (never seen before): insert minimal placeholders so
+      // the FK on leases (referencing `physical_device_id`) can still resolve.
+      const existing = this.stmtGetPhysicalDeviceHealth.get(input.physicalDeviceId) as any;
+      if (existing) {
+        this.stmtUpdateHealth.run({
+          physicalDeviceId: input.physicalDeviceId,
+          healthScore: input.healthScore,
+          healthReasonsJson: JSON.stringify(input.healthReasons),
+          healthLastEvaluatedAt: input.healthLastEvaluatedAt,
+          updatedAt: Date.now(),
+        });
+      } else {
+        // Use the lease-state transition's physicalDeviceId; we don't yet have a
+        // transport row for a never-seen device so create a stub that the next
+        // recordPhysicalMapping call will overwrite.
+        this.stmtUpsertHealthCounters.run({
+          physicalDeviceId: input.physicalDeviceId,
+          currentTransportId: input.physicalDeviceId,
+          lastSeenTransportId: input.physicalDeviceId,
+          serials: JSON.stringify([]),
+          updatedAt: Date.now(),
+          healthScore: input.healthScore,
+          healthReasonsJson: JSON.stringify(input.healthReasons),
+          healthLastEvaluatedAt: input.healthLastEvaluatedAt,
+          propsAttempts: 0,
+          propsFailures: 0,
+          propsWindowStartedAt: 0,
+          reconnectCount: 0,
+          reconnectWindowStartedAt: 0,
+          rebootCount: 0,
+          auditWindowStartedAt: 0,
+          lastStatusChangeAt: 0,
+        });
+      }
+    } catch (err) {
+      console.warn(`[DeviceStore] Failed to save health for ${input.physicalDeviceId}:`, err);
+    }
+  }
+
+  /**
+   * Increment the per-device getProperties counters atomically. Counts both
+   * attempts and (optionally) failures; the health monitor calls this for every
+   * properties-fetch outcome.
+   */
+  recordPropsOutcome(physicalDeviceId: string, success: boolean): void {
+    try {
+      const now = Date.now();
+      if (success) {
+        this.stmtIncrementPropsAttempts.run(now, now, physicalDeviceId);
+      } else {
+        this.stmtIncrementPropsFailures.run(now, now, physicalDeviceId);
+      }
+    } catch (err) {
+      console.warn(`[DeviceStore] Failed to record props outcome for ${physicalDeviceId}:`, err);
+    }
+  }
+
+  /**
+   * Increment the per-device reconnect counter. Called from the device-tracker
+   * whenever an offline→online transition is observed (proxy for USB churn when
+   * per-port current isn't available — see power.ts).
+   */
+  recordReconnect(physicalDeviceId: string): void {
+    try {
+      const now = Date.now();
+      this.stmtIncrementReconnect.run(now, now, now, physicalDeviceId);
+    } catch (err) {
+      console.warn(`[DeviceStore] Failed to record reconnect for ${physicalDeviceId}:`, err);
+    }
+  }
+
+  /**
+   * Force-clear all health counters on a device. Intended for test fixtures and
+   * the demo's "after-recovery" snapshot — production code should rely on
+   * `resetHealthCountersIfStale` instead.
+   */
+  resetHealthCounters(physicalDeviceId: string): void {
+    const now = Date.now();
+    try {
+      this.db.prepare(`
+        UPDATE physical_devices SET
+          props_attempts = 0,
+          props_failures = 0,
+          props_window_started_at = @now,
+          reconnect_count = 0,
+          reconnect_window_started_at = @now,
+          reboot_count = 0,
+          audit_window_started_at = @now,
+          last_status_change_at = 0,
+          updated_at = @now
+        WHERE physical_device_id = @id
+      `).run({ now, id: physicalDeviceId });
+    } catch (err) {
+      console.warn(`[DeviceStore] Failed to reset health counters for ${physicalDeviceId}:`, err);
+    }
+  }
+
+  /**
+   * Reset counters when their window has expired (older than `windowMs`).
+   * Done as a single UPDATE so we don't race with concurrent increments.
+   */
+  resetHealthCountersIfStale(
+    physicalDeviceId: string,
+    now: number,
+    windowMs: number,
+  ): void {
+    try {
+      this.stmtResetHealthCountersIfStale.run({
+        physicalDeviceId,
+        sinceMs: now,
+        windowMs,
+        resetValue: 0,
+      } as any);
+    } catch (err) {
+      console.warn(`[DeviceStore] Failed to reset health counters for ${physicalDeviceId}:`, err);
     }
   }
 

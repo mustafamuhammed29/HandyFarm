@@ -23,6 +23,8 @@ export interface ApiServerOptions {
   verifyBaseline?: (deviceId: string) => Promise<{ success: boolean; result?: any; error?: string }>;
   resetToBaseline?: (deviceId: string, sessionId?: string) => Promise<{ success: boolean; actions?: string[]; verification?: any; error?: string }>;
   runNetworkPreflight?: (deviceId: string, options?: { expectedCarrier?: string; runId?: string; requiredBytes?: number }) => Promise<any>;
+  /** Force an immediate HealthMonitor tick (Phase 4). Returns {evaluated, transitions}. */
+  tickHealthMonitor?: () => Promise<{ evaluated: number; transitions: number }>;
 }
 
 export interface ApiServerHandle {
@@ -647,6 +649,118 @@ export async function startApiServer(options: ApiServerOptions): Promise<ApiServ
         } catch (err: any) {
           return sendJson(res, 400, { success: false, error: err?.message || 'Failed to record consumption' });
         }
+      }
+
+      // ----- Phase 4: fleet health + safety endpoints -----
+
+      // 22. GET /fleet/health — fleet-level health summary.
+      if (pathname === '/fleet/health' && method === 'GET') {
+        const fleet = deviceStore.getAllPhysicalDeviceHealth();
+        const summary = {
+          total: fleet.length,
+          quarantined: 0,
+          degraded: 0,
+          healthy: 0,
+          unknown: 0,
+          avgScore: 0,
+          minScore: 100,
+        };
+        let scoreSum = 0;
+        for (const pd of fleet) {
+          const lease = deviceStore.getLease(pd.physicalDeviceId);
+          if (lease.state === 'quarantined') summary.quarantined++;
+          else if (pd.healthScore <= 40) summary.degraded++;
+          else if (pd.healthScore >= 60) summary.healthy++;
+          else summary.degraded++;
+          if (pd.healthScore === 100 && pd.propsAttempts === 0 && pd.reconnectCount === 0) summary.unknown++;
+          scoreSum += pd.healthScore;
+          if (pd.healthScore < summary.minScore) summary.minScore = pd.healthScore;
+        }
+        summary.avgScore = fleet.length > 0 ? Math.round(scoreSum / fleet.length) : 0;
+        if (fleet.length === 0) summary.minScore = 0;
+        return sendJson(res, 200, { success: true, summary, devices: fleet.map(pd => ({
+          physicalDeviceId: pd.physicalDeviceId,
+          healthScore: pd.healthScore,
+          reasons: JSON.parse(pd.healthReasonsJson || '[]'),
+          lastEvaluatedAt: pd.healthLastEvaluatedAt,
+          leaseState: deviceStore.getLease(pd.physicalDeviceId).state,
+        })) });
+      }
+
+      // 23. GET /devices/:id/health — health snapshot for one device.
+      const deviceHealthMatch = pathname.match(/^\/devices\/([^/]+)\/health\/?$/);
+      if (deviceHealthMatch && method === 'GET') {
+        const rawId = decodeURIComponent(deviceHealthMatch[1]);
+        let physId = rawId;
+        const dev = deviceStore.getDevice(rawId);
+        if (dev?.physicalDeviceId) physId = dev.physicalDeviceId;
+        const mapping = deviceStore.getPhysicalMapping(rawId);
+        if (!dev && mapping?.physicalDeviceId) physId = mapping.physicalDeviceId;
+
+        const health = deviceStore.getPhysicalDeviceHealth(physId);
+        const lease = deviceStore.getLease(physId);
+        const audit = deviceStore.getAuditForDevice(physId, Date.now() - 5 * 60_000);
+
+        return sendJson(res, 200, {
+          success: true,
+          physicalDeviceId: physId,
+          healthScore: health.healthScore,
+          reasons: JSON.parse(health.healthReasonsJson || '[]'),
+          lastEvaluatedAt: health.healthLastEvaluatedAt,
+          counters: {
+            propsAttempts: health.propsAttempts,
+            propsFailures: health.propsFailures,
+            reconnectCount: health.reconnectCount,
+            rebootCount: health.rebootCount,
+          },
+          lease,
+          recentAuditCount: audit.length,
+          recentFailedAuditCount: audit.filter(a => a.status === 'failed').length,
+        });
+      }
+
+      // 24. POST /devices/:id/health/evaluate — force an immediate tick for one device.
+      const evaluateMatch = pathname.match(/^\/devices\/([^/]+)\/health\/evaluate\/?$/);
+      if (evaluateMatch && method === 'POST') {
+        if (!options.tickHealthMonitor) {
+          return sendJson(res, 501, { success: false, error: 'Health monitor is not configured on this server' });
+        }
+        const result = await options.tickHealthMonitor();
+        return sendJson(res, 200, { success: true, ...result });
+      }
+
+      // 25. POST /devices/:id/quarantine — manual quarantine (operator override).
+      const quarantineMatch = pathname.match(/^\/devices\/([^/]+)\/quarantine\/?$/);
+      if (quarantineMatch && method === 'POST') {
+        const rawId = decodeURIComponent(quarantineMatch[1]);
+        let physId = rawId;
+        const dev = deviceStore.getDevice(rawId);
+        if (dev?.physicalDeviceId) physId = dev.physicalDeviceId;
+        const mapping = deviceStore.getPhysicalMapping(rawId);
+        if (!dev && mapping?.physicalDeviceId) physId = mapping.physicalDeviceId;
+
+        const body = await parseJsonBody(req);
+        const reason = typeof body.reason === 'string' && body.reason.trim()
+          ? body.reason.trim().slice(0, 500)
+          : 'manual quarantine';
+        const result = deviceStore.setDeviceLeaseState(physId, 'quarantined', 'operator');
+        console.log(`[API] Manual quarantine: ${physId} — ${reason}`);
+        return sendJson(res, 200, { success: result.success, physicalDeviceId: physId, lease: deviceStore.getLease(physId), reason });
+      }
+
+      // 26. POST /devices/:id/quarantine/clear — clear a manual or auto quarantine.
+      const quarantineClearMatch = pathname.match(/^\/devices\/([^/]+)\/quarantine\/clear\/?$/);
+      if (quarantineClearMatch && method === 'POST') {
+        const rawId = decodeURIComponent(quarantineClearMatch[1]);
+        let physId = rawId;
+        const dev = deviceStore.getDevice(rawId);
+        if (dev?.physicalDeviceId) physId = dev.physicalDeviceId;
+        const mapping = deviceStore.getPhysicalMapping(rawId);
+        if (!dev && mapping?.physicalDeviceId) physId = mapping.physicalDeviceId;
+
+        const result = deviceStore.setDeviceLeaseState(physId, 'available');
+        console.log(`[API] Manual quarantine clear: ${physId}`);
+        return sendJson(res, 200, { success: result.success, physicalDeviceId: physId, lease: deviceStore.getLease(physId) });
       }
 
       // Fallback 404 Not Found

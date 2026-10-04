@@ -46,6 +46,13 @@ const sqliteDbPath = path.join(app.getPath('userData'), 'handyfarm.db');
 const legacyJsonPath = path.join(app.getPath('userData'), 'devices.json');
 const deviceStore = new DeviceStore(sqliteDbPath, legacyJsonPath);
 
+// Phase 4: fleet health monitor. Created lazily on app.ready so we have access
+// to the fully-initialized DeviceStore. See app.whenReady().then(...) below.
+let healthMonitor: HealthMonitor | null = null;
+const RECONNECT_SCHEDULER_BASE_CAP = 3;
+const ADAPTIVE_CAP_BUDGET_KBPS = 480_000; // USB 2.0 hi-speed nominal
+let reconnectScheduler: Scheduler | null = null;
+
 function broadcastDelta(deviceId: string, patch: Partial<DeviceData>, removed = false) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('devices-updated', {
@@ -237,6 +244,41 @@ app.whenReady().then(() => {
     console.warn('WARNING: safeStorage encryption is not available on this system.');
   }
   createWindow();
+
+  // Phase 4: start the health monitor before any tracker events arrive so the
+  // first batch of presence events is captured. The monitor is idempotent: safe
+  // to call start() once per process lifetime.
+  healthMonitor = new HealthMonitor(deviceStore, {
+    tickMs: 30_000,
+    windowMs: 5 * 60_000,
+    staleLeaseMs: 5 * 60_000,
+  });
+  healthMonitor.start();
+  console.log('[Phase 4] HealthMonitor started (tick=30s, window=5m, staleLease=5m).');
+
+  // Phase 4: periodic adaptive-cap recompute. Reads the current fleet bandwidth
+  // estimate from power.ts and re-caps the auto-reconnect scheduler. Without this
+  // hook the scheduler would stay at the static cap=3 even when the USB budget
+  // saturates.
+  setInterval(() => {
+    if (!reconnectScheduler) return;
+    try {
+      const bandwidth = estimateFleetBandwidthKbps([]);
+      const cap = getAdaptiveConcurrencyCap({
+        baseCap: RECONNECT_SCHEDULER_BASE_CAP,
+        totalBandwidthKbps: bandwidth,
+        bandwidthBudgetKbps: ADAPTIVE_CAP_BUDGET_KBPS,
+        floorCap: 1,
+      });
+      if (cap.cap !== reconnectScheduler.getConcurrencyCap()) {
+        reconnectScheduler.setConcurrencyCap(cap.cap);
+        console.log(`[Phase 4] Adaptive cap → ${cap.cap} (utilization=${(cap.bandwidthUtilization * 100).toFixed(0)}%)`);
+      }
+    } catch (err) {
+      console.warn('[Phase 4] adaptive-cap tick failed:', err);
+    }
+  }, 60_000); // re-evaluate once a minute
+
   startAdbTracker();
 
   // Start Phase 7 loopback REST API server
@@ -252,6 +294,10 @@ app.whenReady().then(() => {
     captureBaseline,
     verifyBaseline,
     resetToBaseline: resetDeviceToBaseline,
+    tickHealthMonitor: async () => {
+      if (!healthMonitor) return { evaluated: 0, transitions: 0 };
+      return healthMonitor.tick();
+    },
     runNetworkPreflight: async (deviceId, opts = {}) => {
       const dev = deviceStore.getDevice(deviceId);
       const physId = dev?.physicalDeviceId || `phys_${dev?.serial || deviceId}`;
@@ -370,6 +416,8 @@ async function startAdbTracker() {
     tracker.on('remove', async (device: any) => {
       console.log('Device removed:', device.id);
       const dev = deviceStore.getDevice(device.id);
+      const physId = dev?.physicalDeviceId;
+      if (physId && healthMonitor) healthMonitor.recordPresence(physId, 'absent');
 
       const worker = workers.get(device.id);
       if (worker) {
@@ -431,6 +479,17 @@ async function startAdbTracker() {
       deviceStore.updateDevice(device.id, patch);
       broadcastDelta(device.id, patch);
 
+      // Phase 4: feed presence events to the health monitor. A device that comes
+      // back online after being offline is also a "reconnect" signal that should
+      // bump the per-device reconnect counter.
+      const physId = dev?.physicalDeviceId;
+      if (physId && healthMonitor) {
+        healthMonitor.recordPresence(physId, device.type === 'device' ? 'present' : 'present');
+        if (device.type === 'device') {
+          deviceStore.recordReconnect(physId);
+        }
+      }
+
       const worker = workers.get(device.id);
       if (worker && !worker.killed && worker.connected) {
         try { worker.send({ type: 'STATUS_CHANGE', status: device.type }); } catch(e){}
@@ -443,14 +502,42 @@ async function startAdbTracker() {
     // Routed through the fan-out scheduler so a 20-device farm doesn't slam adb with
     // 20 parallel connect() calls every 15 seconds. Concurrency cap + per-device
     // randomized delay smooths the burst.
-    const reconnectScheduler = new Scheduler({
-      globalConcurrencyCap: 3,
+    reconnectScheduler = new Scheduler({
+      globalConcurrencyCap: RECONNECT_SCHEDULER_BASE_CAP,
       rateLimit: { maxJobs: 8, windowMs: 15000 }, // ≤8 connect attempts per 15s sweep window
       defaultDelay: { minMs: 200, maxMs: 800 },
     });
     reconnectScheduler.onAudit((e) => {
       if (e.status === 'completed' || e.status === 'failed') {
         console.log(`[Auto-Reconnect audit] ${e.jobId} ${e.label || ''} status=${e.status} delayMs=${e.appliedDelayMs} ${e.error ? 'err=' + e.error : ''}`);
+      }
+      // Phase 4: persist to scheduler_audit so the health monitor can score
+      // flakiness from real runs across restarts. Only terminal statuses
+      // (completed/failed/cancelled) are persisted — otherwise the health
+      // counter would double-count every queued/running transition. Best-effort
+      // — failures are logged but never break the scheduler.
+      if (e.status === 'completed' || e.status === 'failed' || e.status === 'cancelled') {
+        try {
+          const auditEntry = e as any;
+          deviceStore.insertAuditEntry({
+            jobId: e.jobId,
+            groupId: e.groupId,
+            deviceId: auditEntry.deviceId,
+            physicalDeviceId: auditEntry.physicalDeviceId,
+            label: e.label,
+            priority: e.priority,
+            status: e.status,
+            scheduledAt: e.scheduledAt,
+            startedAt: e.startedAt,
+            completedAt: e.completedAt,
+            appliedDelayMs: e.appliedDelayMs,
+            orderIndex: e.orderIndex,
+            error: e.error,
+            result: e.result,
+          });
+        } catch (err) {
+          console.warn('[Phase 4] Failed to persist scheduler audit entry:', err);
+        }
       }
     });
     setInterval(() => {
@@ -459,7 +546,7 @@ async function startAdbTracker() {
         const deviceId = dev.id;
         if (!deviceId.includes(':') && (dev.status === 'offline' || dev.status === 'disconnect') && dev.lastKnownIp) {
           const hasActiveWifi = allDevs.some(d => d.id.includes(':') && d.serial === dev.serial && d.status === 'device');
-          if (!hasActiveWifi && /^(\d{1,3}\.){3}\d{1,3}$/.test(dev.lastKnownIp)) {
+          if (!hasActiveWifi && /^(\d{1,3}\.){3}\d{1,3}$/.test(dev.lastKnownIp) && reconnectScheduler) {
             reconnectScheduler.submit({
               label: `reconnect-${deviceId}-${dev.lastKnownIp}`,
               groupId: 'auto-reconnect',
@@ -1949,6 +2036,10 @@ import { parseAllowedCommand, isSafeAdbCommand, ALLOWED_OPS } from './safeAdb.js
 export { parseAllowedCommand, isSafeAdbCommand, ALLOWED_OPS };
 import { Scheduler } from './scheduler.js';
 
+// Phase 4: fleet health + safety + adaptive cap.
+import { HealthMonitor } from './healthMonitor.js';
+import { getAdaptiveConcurrencyCap, estimateFleetBandwidthKbps } from './power.js';
+
 ipcMain.handle('get-expert-mode', () => expertModeEnabled);
 ipcMain.handle('set-expert-mode', (_event, enabled: boolean) => {
   expertModeEnabled = Boolean(enabled);
@@ -2292,6 +2383,81 @@ ipcMain.handle('set-device-lease-state', async (_event, physicalDeviceId: string
       });
     }
   }
+  return res;
+});
+
+// ----- Phase 4: fleet health IPC -----
+
+ipcMain.handle('get-fleet-health', async () => {
+  const fleet = deviceStore.getAllPhysicalDeviceHealth();
+  return {
+    total: fleet.length,
+    devices: fleet.map(pd => ({
+      physicalDeviceId: pd.physicalDeviceId,
+      healthScore: pd.healthScore,
+      reasons: JSON.parse(pd.healthReasonsJson || '[]'),
+      lastEvaluatedAt: pd.healthLastEvaluatedAt,
+      leaseState: deviceStore.getLease(pd.physicalDeviceId).state,
+      propsAttempts: pd.propsAttempts,
+      propsFailures: pd.propsFailures,
+      reconnectCount: pd.reconnectCount,
+    })),
+  };
+});
+
+ipcMain.handle('get-device-health', async (_event, deviceId: string) => {
+  let physId = deviceId;
+  const dev = deviceStore.getDevice(deviceId);
+  if (dev?.physicalDeviceId) physId = dev.physicalDeviceId;
+  const mapping = deviceStore.getPhysicalMapping(deviceId);
+  if (!dev && mapping?.physicalDeviceId) physId = mapping.physicalDeviceId;
+
+  const health = deviceStore.getPhysicalDeviceHealth(physId);
+  const lease = deviceStore.getLease(physId);
+  return {
+    physicalDeviceId: physId,
+    healthScore: health.healthScore,
+    reasons: JSON.parse(health.healthReasonsJson || '[]'),
+    lastEvaluatedAt: health.healthLastEvaluatedAt,
+    counters: {
+      propsAttempts: health.propsAttempts,
+      propsFailures: health.propsFailures,
+      reconnectCount: health.reconnectCount,
+      rebootCount: health.rebootCount,
+    },
+    lease,
+  };
+});
+
+ipcMain.handle('evaluate-health-now', async () => {
+  if (!healthMonitor) return { evaluated: 0, transitions: 0 };
+  return healthMonitor.tick();
+});
+
+ipcMain.handle('manual-quarantine', async (_event, deviceId: string, reason?: string) => {
+  let physId = deviceId;
+  const dev = deviceStore.getDevice(deviceId);
+  if (dev?.physicalDeviceId) physId = dev.physicalDeviceId;
+  const mapping = deviceStore.getPhysicalMapping(deviceId);
+  if (!dev && mapping?.physicalDeviceId) physId = mapping.physicalDeviceId;
+
+  const cleanReason = typeof reason === 'string' && reason.trim()
+    ? reason.trim().slice(0, 500)
+    : 'manual quarantine';
+  const res = deviceStore.setDeviceLeaseState(physId, 'quarantined', 'operator');
+  console.log(`[IPC] Manual quarantine: ${physId} — ${cleanReason}`);
+  return { ...res, reason: cleanReason };
+});
+
+ipcMain.handle('clear-quarantine', async (_event, deviceId: string) => {
+  let physId = deviceId;
+  const dev = deviceStore.getDevice(deviceId);
+  if (dev?.physicalDeviceId) physId = dev.physicalDeviceId;
+  const mapping = deviceStore.getPhysicalMapping(deviceId);
+  if (!dev && mapping?.physicalDeviceId) physId = mapping.physicalDeviceId;
+
+  const res = deviceStore.setDeviceLeaseState(physId, 'available');
+  console.log(`[IPC] Manual quarantine clear: ${physId}`);
   return res;
 });
 

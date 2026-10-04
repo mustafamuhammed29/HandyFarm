@@ -144,6 +144,32 @@ declare global {
       // Clipper Companion Control Panel
       getClipperInfo?: (deviceId: string) => Promise<{ installed: boolean; version?: string; firstInstallTime?: string; lastUpdateTime?: string; error?: string }>;
       installClipper?: (deviceId: string) => Promise<{ installed: boolean; version?: string; error?: string }>;
+
+      // Phase 4: fleet health
+      getFleetHealth?: () => Promise<{
+        total: number;
+        devices: Array<{
+          physicalDeviceId: string;
+          healthScore: number;
+          reasons: string[];
+          lastEvaluatedAt: number;
+          leaseState: string;
+          propsAttempts: number;
+          propsFailures: number;
+          reconnectCount: number;
+        }>;
+      }>;
+      getDeviceHealth?: (deviceId: string) => Promise<{
+        physicalDeviceId: string;
+        healthScore: number;
+        reasons: string[];
+        lastEvaluatedAt: number;
+        counters: { propsAttempts: number; propsFailures: number; reconnectCount: number; rebootCount: number };
+        lease: { state: string; leasedBy?: string; leaseExpiresAt?: number; lastHeartbeatAt?: number };
+      }>;
+      evaluateHealthNow?: () => Promise<{ evaluated: number; transitions: number }>;
+      manualQuarantine?: (deviceId: string, reason?: string) => Promise<{ success: boolean; error?: string; reason?: string }>;
+      clearQuarantine?: (deviceId: string) => Promise<{ success: boolean; error?: string }>;
     };
   }
 }

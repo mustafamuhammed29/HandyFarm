@@ -72,6 +72,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Clipper Companion Control Panel
   getClipperInfo: (deviceId: string) => ipcRenderer.invoke('get-clipper-info', deviceId),
   installClipper: (deviceId: string) => ipcRenderer.invoke('install-clipper', deviceId),
+
+  // Phase 4: fleet health
+  getFleetHealth: () => ipcRenderer.invoke('get-fleet-health'),
+  getDeviceHealth: (deviceId: string) => ipcRenderer.invoke('get-device-health', deviceId),
+  evaluateHealthNow: () => ipcRenderer.invoke('evaluate-health-now'),
+  manualQuarantine: (deviceId: string, reason?: string) => ipcRenderer.invoke('manual-quarantine', deviceId, reason),
+  clearQuarantine: (deviceId: string) => ipcRenderer.invoke('clear-quarantine', deviceId),
 });
 
 

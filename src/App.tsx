@@ -11,6 +11,7 @@ import { LiveViewPoc } from './components/LiveViewPoc';
 import type { LiveViewPocRef } from './components/LiveViewPoc';
 import { LogcatViewer } from './components/LogcatViewer';
 import { ClipperPanel } from './components/ClipperPanel';
+import { FleetHealthPanel } from './components/FleetHealthPanel';
 
 function App() {
   const [devices, setDevices] = useState<DeviceData[]>([]);
@@ -50,6 +51,11 @@ function App() {
   // Phase 4 states
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
   const [timeSinceUpdate, setTimeSinceUpdate] = useState<number>(0);
+  const [healthByPhysId, setHealthByPhysId] = useState<Record<string, {
+    healthScore: number;
+    reasons: string[];
+    leaseState: string;
+  }>>({});
   const [adbConnected, setAdbConnected] = useState<boolean>(false);
 
   useEffect(() => {
@@ -210,6 +216,25 @@ function App() {
 
   useEffect(() => {
     window.electronAPI.getDevices().then(d => { setDevices(d); setLastUpdated(new Date()); });
+
+    // Phase 4: poll fleet health on a 15s cadence so device-tile score badges
+    // stay in sync with the HealthMonitor.
+    const refreshHealth = () => {
+      window.electronAPI.getFleetHealth?.().then(fleet => {
+        if (!fleet) return;
+        const next: Record<string, { healthScore: number; reasons: string[]; leaseState: string }> = {};
+        for (const d of fleet.devices) {
+          next[d.physicalDeviceId] = {
+            healthScore: d.healthScore,
+            reasons: d.reasons,
+            leaseState: d.leaseState,
+          };
+        }
+        setHealthByPhysId(next);
+      }).catch(() => { /* best-effort */ });
+    };
+    refreshHealth();
+    const healthInterval = setInterval(refreshHealth, 15_000);
     window.electronAPI.onDevicesUpdated((update) => {
       setDevices(prevDevices => {
         let nextDevices: DeviceData[];
@@ -239,6 +264,7 @@ function App() {
         return nextDevices;
       });
     });
+    return () => clearInterval(healthInterval);
   }, []);
 
   const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark');
@@ -794,6 +820,19 @@ function App() {
           </div>
 
         <div className="action-section">
+            <div style={{display:'flex', alignItems:'center', gap:'8px', cursor: 'pointer', userSelect: 'none'}} onClick={() => toggleSection('Fleet Health')}>
+              {expandedSections.has('Fleet Health') ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+              <span style={{fontWeight: '500'}}>Fleet Health</span>
+              <span style={{fontSize: '10px', color: 'var(--text-muted)', marginLeft: '4px'}}>Phase 4</span>
+            </div>
+            {expandedSections.has('Fleet Health') && (
+              <div style={{display: 'flex', flexDirection: 'column', gap: '8px', background: 'var(--bg-color)', padding: '12px', borderRadius: '8px', marginTop: '12px'}}>
+                <FleetHealthPanel devices={devices} />
+              </div>
+            )}
+          </div>
+
+        <div className="action-section">
             <div style={{display:'flex', alignItems:'center', gap:'8px', cursor: 'pointer', userSelect: 'none'}} onClick={() => toggleSection('Clipper Companion')}>
               {expandedSections.has('Clipper Companion') ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
               <span style={{fontWeight: '500'}}>Clipper Companion</span>
@@ -991,6 +1030,33 @@ function App() {
                           {state === 'quarantined' && '⚠️ '}
                           {state === 'maintenance' && '🔧 '}
                           {label}
+                        </span>
+                      );
+                    })()}
+
+                    {/* Phase 4: inline health score */}
+                    {healthByPhysId[device.physicalDeviceId || `phys_${device.serial || device.id}`] && (() => {
+                      const h = healthByPhysId[device.physicalDeviceId || `phys_${device.serial || device.id}`];
+                      const color = h.healthScore >= 80
+                        ? 'var(--status-online)'
+                        : h.healthScore >= 60
+                          ? '#facc15'
+                          : h.healthScore >= 40
+                            ? '#fb923c'
+                            : 'var(--status-error)';
+                      return (
+                        <span
+                          className="lease-badge"
+                          style={{
+                            background: 'var(--bg-color)',
+                            color,
+                            borderColor: color,
+                            fontSize: '10px',
+                            padding: '1px 6px',
+                          }}
+                          title={h.reasons.length > 0 ? `Score ${h.healthScore}: ${h.reasons.join('; ')}` : `Health score: ${h.healthScore}`}
+                        >
+                          ♥ {h.healthScore}
                         </span>
                       );
                     })()}
