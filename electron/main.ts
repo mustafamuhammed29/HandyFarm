@@ -439,25 +439,41 @@ async function startAdbTracker() {
       }
     });
 
-    // Background Auto-Reconnect Loop for WiFi devices
-    setInterval(async () => {
+    // Background Auto-Reconnect Loop for WiFi devices.
+    // Routed through the fan-out scheduler so a 20-device farm doesn't slam adb with
+    // 20 parallel connect() calls every 15 seconds. Concurrency cap + per-device
+    // randomized delay smooths the burst.
+    const reconnectScheduler = new Scheduler({
+      globalConcurrencyCap: 3,
+      rateLimit: { maxJobs: 8, windowMs: 15000 }, // ≤8 connect attempts per 15s sweep window
+      defaultDelay: { minMs: 200, maxMs: 800 },
+    });
+    reconnectScheduler.onAudit((e) => {
+      if (e.status === 'completed' || e.status === 'failed') {
+        console.log(`[Auto-Reconnect audit] ${e.jobId} ${e.label || ''} status=${e.status} delayMs=${e.appliedDelayMs} ${e.error ? 'err=' + e.error : ''}`);
+      }
+    });
+    setInterval(() => {
       const allDevs = deviceStore.getAllDevices(false);
       for (const dev of allDevs) {
         const deviceId = dev.id;
-        // If it's a USB device and it's offline and has a known IP
         if (!deviceId.includes(':') && (dev.status === 'offline' || dev.status === 'disconnect') && dev.lastKnownIp) {
-          // Check if it's already actively connected via WiFi
           const hasActiveWifi = allDevs.some(d => d.id.includes(':') && d.serial === dev.serial && d.status === 'device');
-          if (!hasActiveWifi) {
-            console.log(`[Auto-Reconnect] Attempting to reconnect offline device ${deviceId} via last known IP ${dev.lastKnownIp}:5555`);
-            try {
-              if (/^(\d{1,3}\.){3}\d{1,3}$/.test(dev.lastKnownIp)) {
-                const { stdout } = await execFileAsync('adb', ['connect', `${dev.lastKnownIp}:5555`]);
-                console.log(`[Auto-Reconnect] Output for ${dev.lastKnownIp}: ${stdout}`);
-              }
-            } catch (e) {
-              console.error(`[Auto-Reconnect] Failed for ${dev.lastKnownIp}`);
-            }
+          if (!hasActiveWifi && /^(\d{1,3}\.){3}\d{1,3}$/.test(dev.lastKnownIp)) {
+            reconnectScheduler.submit({
+              label: `reconnect-${deviceId}-${dev.lastKnownIp}`,
+              groupId: 'auto-reconnect',
+              action: async () => {
+                console.log(`[Auto-Reconnect] Attempting to reconnect offline device ${deviceId} via last known IP ${dev.lastKnownIp}:5555`);
+                try {
+                  const { stdout } = await execFileAsync('adb', ['connect', `${dev.lastKnownIp}:5555`]);
+                  console.log(`[Auto-Reconnect] Output for ${dev.lastKnownIp}: ${stdout}`);
+                } catch (e) {
+                  console.error(`[Auto-Reconnect] Failed for ${dev.lastKnownIp}`);
+                  throw e;
+                }
+              },
+            });
           }
         }
       }
@@ -1931,6 +1947,7 @@ let expertModeEnabled = false;
 // side effects on import — so tests can require it directly. See electron/safeAdb.ts.
 import { parseAllowedCommand, isSafeAdbCommand, ALLOWED_OPS } from './safeAdb.js';
 export { parseAllowedCommand, isSafeAdbCommand, ALLOWED_OPS };
+import { Scheduler } from './scheduler.js';
 
 ipcMain.handle('get-expert-mode', () => expertModeEnabled);
 ipcMain.handle('set-expert-mode', (_event, enabled: boolean) => {
