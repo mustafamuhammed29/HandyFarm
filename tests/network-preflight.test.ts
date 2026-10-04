@@ -354,6 +354,35 @@ NetworkAgentInfo{network{200}
       expect(result.isCellularDefault).toBe(false);
       expect(result.reason).toMatch(/CELLULAR_DATA_DISABLED/);
     });
+
+    // Regression: a device with NO network at all (dead modem, SIM out of service) used to be
+    // certified as cellular-attached, because the check inferred transport from the wifi_on and
+    // mobile_data settings flags rather than from observed network state. Live capture from
+    // device 106293738O006649 on 2026-10-04: "Active default network: none" with
+    // mDataConnectionState=-1, yet the check reported isCellularDefault=true and
+    // "Cellular is verified as active default route". Settings alone prove nothing.
+    it('FAILS — no active network at all (must not infer cellular from settings flags)', async () => {
+      const exec = mockAdb({
+        'wifi_on': '0',
+        'mobile_data': '1',
+        'dumpsys connectivity': 'Active default network: none'
+      });
+      const result = await checkCellularDefaultRoute('dev_04', exec);
+      expect(result.isCellularDefault).toBe(false);
+      expect(result.activeTransport).toBe('unknown');
+      expect(result.reason).toMatch(/NO_ACTIVE_NETWORK/);
+    });
+
+    it('FAILS — when the active transport is VPN rather than cellular', async () => {
+      const exec = mockAdb({
+        'wifi_on': '0',
+        'mobile_data': '1',
+        'dumpsys connectivity': 'Active default network: 7\nNetworkAgentInfo{network{7}\n  Transports: VPN\n}'
+      });
+      const result = await checkCellularDefaultRoute('dev_05', exec);
+      expect(result.isCellularDefault).toBe(false);
+      expect(result.activeTransport).toBe('vpn');
+    });
   });
 });
 
@@ -441,6 +470,27 @@ describe('§5 Full Network Preflight Orchestration', () => {
     expect(result.checks).toHaveLength(1);
     expect(result.checks[0].check).toBe('dual_transport_cellular_route');
     expect(result.error).toMatch(/DUAL_TRANSPORT_VIOLATION/);
+  });
+
+  // Regression: the zero-network case must halt the run at check 1, before the carrier, budget,
+  // and egress checks are allowed to report a misleading pass.
+  it('fails at check 1 on a device with no network and never reaches the egress step', async () => {
+    const exec = mockAdb({
+      'wifi_on': '0',
+      'mobile_data': '1',
+      'dumpsys connectivity': 'Active default network: none'
+    });
+    const recordEgress = vi.fn();
+    const result = await executeNetworkPreflight(
+      { deviceId: 'dev_01' },
+      { getSimForDevice: () => makeSim(), recordEgress, execAdb: exec }
+    );
+    expect(result.passed).toBe(false);
+    expect(result.checks).toHaveLength(1);
+    expect(result.checks[0].check).toBe('dual_transport_cellular_route');
+    expect(result.checks[0].passed).toBe(false);
+    expect(result.error).toMatch(/NO_ACTIVE_NETWORK/);
+    expect(recordEgress).not.toHaveBeenCalled();
   });
 
   it('fails at check 2 when no SIM is assigned', async () => {

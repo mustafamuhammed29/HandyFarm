@@ -574,7 +574,7 @@ export async function startApiServer(options: ApiServerOptions): Promise<ApiServ
       const egressHistoryMatch = pathname.match(/^\/devices\/([^/]+)\/egress\/history\/?$/);
       if (egressHistoryMatch && method === 'GET') {
         const rawId = decodeURIComponent(egressHistoryMatch[1]);
-        const limitParam = parsedUrl.query?.limit;
+        const limitParam = parsedUrl.searchParams.get('limit');
         const limit = limitParam ? Number(limitParam) : 50;
         const egressHistory = deviceStore.getEgressHistory(rawId, limit);
         return sendJson(res, 200, { success: true, deviceId: rawId, egressHistory, count: egressHistory.length });

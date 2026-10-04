@@ -367,10 +367,20 @@ export async function checkCellularDefaultRoute(
     };
   }
 
-  const isCellular = transport === 'cellular' || (!wifiEnabled && mobileDataEnabled);
+  if (transport === 'unknown') {
+    return {
+      isCellularDefault: false,
+      activeTransport: 'unknown',
+      wifiEnabled,
+      mobileDataEnabled,
+      reason: 'NO_ACTIVE_NETWORK: No active default network detected (dumpsys connectivity reports "Active default network: none"). The modem has no data connection; the wifi_on and mobile_data settings alone do not prove that a cellular network exists. Verify SIM registration (adb shell getprop gsm.operator.numeric) and data state (adb shell dumpsys telephony.registry) before running network-sensitive tests.'
+    };
+  }
+
+  const isCellular = transport === 'cellular';
   return {
     isCellularDefault: isCellular,
-    activeTransport: transport === 'unknown' ? (isCellular ? 'cellular' : 'unknown') : transport,
+    activeTransport: transport,
     wifiEnabled: false,
     mobileDataEnabled: true
   };
