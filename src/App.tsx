@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useCallback } from 'react';
+import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { 
   Smartphone, XCircle, Play, CheckSquare, Square, RefreshCw, Link as LinkIcon, Download, 
   Moon, Sun, Pin, PinOff, Settings, Search,
@@ -12,6 +12,10 @@ import type { LiveViewPocRef } from './components/LiveViewPoc';
 import { LogcatViewer } from './components/LogcatViewer';
 import { ClipperPanel } from './components/ClipperPanel';
 import { FleetHealthPanel } from './components/FleetHealthPanel';
+import { FleetFilterBar } from './components/FleetFilterBar';
+import { DeviceRow } from './components/DeviceRow';
+import { DeviceDetailModal } from './components/DeviceDetailModal';
+import { applyFilter } from './components/FleetFilterBar';
 
 function App() {
   const [devices, setDevices] = useState<DeviceData[]>([]);
@@ -52,10 +56,28 @@ function App() {
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
   const [timeSinceUpdate, setTimeSinceUpdate] = useState<number>(0);
   const [healthByPhysId, setHealthByPhysId] = useState<Record<string, {
-    healthScore: number;
-    reasons: string[];
-    leaseState: string;
-  }>>({});
+  healthScore: number;
+  reasons: string[];
+  leaseState: string;
+  lastEvaluatedAt?: number;
+  propsAttempts?: number;
+  propsFailures?: number;
+  reconnectCount?: number;
+  rebootCount?: number;
+}>>({});
+
+// Phase 6: filter + view-mode + detail modal state.
+const [filterQuery, setFilterQuery] = useState('');
+const [viewMode, setViewMode] = useState<'grid' | 'rows'>(() => {
+  return (localStorage.getItem('viewMode') as 'grid' | 'rows') || 'rows';
+});
+useEffect(() => { localStorage.setItem('viewMode', viewMode); }, [viewMode]);
+const [detailDeviceId, setDetailDeviceId] = useState<string | null>(null);
+const [now, setNow] = useState<number>(Date.now());
+useEffect(() => {
+  const id = setInterval(() => setNow(Date.now()), 1000);
+  return () => clearInterval(id);
+}, []);
   const [adbConnected, setAdbConnected] = useState<boolean>(false);
 
   useEffect(() => {
@@ -222,7 +244,11 @@ function App() {
     const refreshHealth = () => {
       window.electronAPI.getFleetHealth?.().then(fleet => {
         if (!fleet) return;
-        const next: Record<string, { healthScore: number; reasons: string[]; leaseState: string }> = {};
+        const next: Record<string, {
+          healthScore: number; reasons: string[]; leaseState: string;
+          lastEvaluatedAt?: number; propsAttempts?: number; propsFailures?: number;
+          reconnectCount?: number; rebootCount?: number;
+        }> = {};
         for (const d of fleet.devices) {
           next[d.physicalDeviceId] = {
             healthScore: d.healthScore,
@@ -324,7 +350,14 @@ function App() {
     return filtered;
   };
 
-  const visibleDevices = getFilteredDevices().sort((a, b) => {
+  // Phase 6: apply the new FleetFilterBar's tokens + free-text on top of the
+  // legacy search. Keeps backward compat for callers of `visibleDevices`.
+  const phase6Result = useMemo(
+    () => applyFilter(getFilteredDevices(), filterQuery, healthByPhysId as any, showOffline),
+    [getFilteredDevices, filterQuery, healthByPhysId, showOffline],
+  );
+
+  const visibleDevices = phase6Result.matched.sort((a, b) => {
     const tA = a.connectedAt || 0;
     const tB = b.connectedAt || 0;
     return tA - tB;
@@ -925,8 +958,57 @@ function App() {
             </div>
           </div>
         </div>
-        
-        <div className="focused-view" style={{ 
+
+        {/* Phase 6: FleetFilterBar — search + field tokens + 4-stat strip */}
+        <FleetFilterBar
+          devices={devices}
+          filtered={visibleDevices}
+          healthByPhysId={healthByPhysId as any}
+          query={filterQuery}
+          setQuery={setFilterQuery}
+        />
+
+        {/* Phase 6: view-mode toggle (rows | grid) */}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '4px 16px', gap: '8px', fontSize: '12px', color: 'var(--text-muted)' }}>
+          <button
+            className={viewMode === 'rows' ? 'primary-btn' : 'secondary-btn'}
+            style={{ padding: '4px 10px', fontSize: '12px' }}
+            onClick={() => setViewMode('rows')}
+            data-testid="view-mode-rows"
+          >Rows</button>
+          <button
+            className={viewMode === 'grid' ? 'primary-btn' : 'secondary-btn'}
+            style={{ padding: '4px 10px', fontSize: '12px' }}
+            onClick={() => setViewMode('grid')}
+            data-testid="view-mode-grid"
+          >Tiles</button>
+        </div>
+
+        {viewMode === 'rows' ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', padding: '8px 16px 16px', overflowY: 'auto', maxHeight: 'calc(100vh - 200px)' }}>
+            {visibleDevices.map(d => {
+              const physKey = d.physicalDeviceId || `phys_${d.serial || d.id}`;
+              const h = healthByPhysId[physKey];
+              return (
+                <DeviceRow
+                  key={d.id}
+                  device={d}
+                  health={h}
+                  isSelected={selectedIds.has(d.id)}
+                  onToggleSelect={(id) => toggleDeviceSelect(id, undefined as any)}
+                  onOpenDetail={(id) => setDetailDeviceId(id)}
+                  now={now}
+                />
+              );
+            })}
+            {visibleDevices.length === 0 && (
+              <div style={{ padding: '24px', color: 'var(--text-muted)', textAlign: 'center' }}>
+                No devices match the current filter. Clear it to see all.
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="focused-view" style={{
           display: 'grid', 
           gridTemplateColumns: `repeat(auto-fill, ${Math.floor((gridDensity === 'compact' ? 200 : gridDensity === 'normal' ? 280 : 380) * zoomLevel)}px)`, 
           gap: '16px', 
@@ -1223,6 +1305,7 @@ function App() {
             );
           })}
         </div>
+        )}
 
         {results && (
           <div className="results-overlay">
@@ -1248,6 +1331,27 @@ function App() {
           </div>
         )}
       </main>
+
+      {/* Phase 6: per-device detail modal */}
+      <DeviceDetailModal
+        device={detailDeviceId ? devices.find(d => d.id === detailDeviceId) || null : null}
+        health={detailDeviceId ? (() => {
+          const d = devices.find(x => x.id === detailDeviceId);
+          const physKey = d?.physicalDeviceId || `phys_${d?.serial || d?.id}`;
+          return healthByPhysId[physKey];
+        })() : undefined}
+        onClose={() => setDetailDeviceId(null)}
+        onRunRegression={(id) => window.electronAPI.runRegression?.({
+          runner: 'miniflow',
+          deviceId: id,
+          runId: `ui-${Date.now()}`,
+          sessionId: 'ui-user',
+          flow: { flowContent: '- sleep: 200\n- takeScreenshot: ui-' + id + '.png\n' },
+        })}
+        onQuarantine={(id) => window.electronAPI.manualQuarantine?.(id, 'UI action')}
+        onClearQuarantine={(id) => window.electronAPI.clearQuarantine?.(id)}
+        now={now}
+      />
 
       {showAdbConsole && focusedDeviceId && (
         <div className="modal-overlay" onClick={() => setShowAdbConsole(false)}>

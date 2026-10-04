@@ -3,7 +3,18 @@
   --status-warning: #f59e0b;
   --status-error: #ef4444;
   --status-offline: #6b7280;
-  
+
+  /* Unified state palette (Phase 6 UI overhaul). Every visual signal on a
+   * device row — connection, lease, health, baseline — is sourced from one
+   * of these tokens. Inline hex (#facc15, #fb923c, etc.) is gone. */
+  --state-healthy: #10b981;
+  --state-leased: #3b82f6;
+  --state-warning: #f59e0b;
+  --state-degraded: #fb923c;
+  --state-quarantined: #ef4444;
+  --state-offline: #6b7280;
+  --state-unknown: #475569;
+
   --bg-color: #0f172a;
   --card-bg: #1e293b;
   --text-main: #f8fafc;
@@ -695,4 +706,4 @@ body {
   background: rgba(100, 116, 139, 0.15);
   color: #94a3b8;
   border: 1px solid rgba(100, 116, 139, 0.25);
-}
+}
