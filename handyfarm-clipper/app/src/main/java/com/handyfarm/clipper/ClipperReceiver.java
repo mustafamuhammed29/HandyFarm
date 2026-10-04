@@ -9,6 +9,10 @@ import android.content.Intent;
 import android.os.Build;
 import android.os.Process;
 import android.util.Log;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStreamReader;
 import org.json.JSONObject;
 
 public class ClipperReceiver extends BroadcastReceiver {
@@ -19,6 +23,15 @@ public class ClipperReceiver extends BroadcastReceiver {
     public static final String ACTION_SET = "clipper.set";
     public static final String ACTION_SET_SHORT = "set";
     public static final String EXTRA_TEXT = "text";
+
+    // L5 fix: file-based clipboard push. Main writes the text to /data/local/tmp/ on the
+    // device via `adb push` (no shell, no string interpolation), then broadcasts the path.
+    // This avoids the previous shell-decode-then-quote trick which was vulnerable to
+    // special characters in user input. Main is responsible for cleaning up the file; the
+    // companion also deletes it as a defense-in-depth.
+    public static final String ACTION_SET_PATH = "handyfarm.clipboard.set.path";
+    public static final String EXTRA_PATH = "path";
+    public static final String CLIPBOARD_TMP_DIR = "/data/local/tmp/";
 
     public static final String ACTION_IDENTITY_GET = "handyfarm.identity.get";
     public static final String ACTION_FOREGROUND_GET = "handyfarm.foreground.get";
@@ -550,6 +563,60 @@ public class ClipperReceiver extends BroadcastReceiver {
             } else {
                 setResultCode(Activity.RESULT_CANCELED);
                 setResultData("No text is provided. Use -e text \"text to be pasted\"");
+            }
+        } else if (ACTION_SET_PATH.equals(action)) {
+            String path = intent.getStringExtra(EXTRA_PATH);
+            if (path == null) {
+                setResultCode(Activity.RESULT_CANCELED);
+                setResultData("ERROR: missing 'path' extra");
+                return;
+            }
+            // Hard pin to the tmp directory; refuse anything else.
+            if (!path.startsWith(CLIPBOARD_TMP_DIR)) {
+                setResultCode(Activity.RESULT_CANCELED);
+                setResultData("ERROR: path must start with " + CLIPBOARD_TMP_DIR);
+                Log.w(TAG, "Refused clipboard set-path outside tmp: " + path);
+                return;
+            }
+            File f = new File(path);
+            if (!f.exists() || !f.isFile()) {
+                setResultCode(Activity.RESULT_CANCELED);
+                setResultData("ERROR: file not found: " + path);
+                return;
+            }
+            if (f.length() > 1024 * 1024) {
+                // 1 MiB cap — way more than any plausible clipboard payload
+                setResultCode(Activity.RESULT_CANCELED);
+                setResultData("ERROR: file too large (" + f.length() + " bytes)");
+                f.delete();
+                return;
+            }
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(new FileInputStream(f), "UTF-8"))) {
+                int c;
+                while ((c = reader.read()) != -1) {
+                    sb.append((char) c);
+                }
+            } catch (Exception e) {
+                setResultCode(Activity.RESULT_CANCELED);
+                setResultData("ERROR: read failed: " + e.getMessage());
+                return;
+            }
+            String text = sb.toString();
+            try {
+                ClipData clip = ClipData.newPlainText("text", text);
+                cm.setPrimaryClip(clip);
+                setResultCode(Activity.RESULT_OK);
+                setResultData("OK:" + text.length());
+                Log.i(TAG, "Copied " + text.length() + " chars to clipboard from " + path);
+            } catch (Exception e) {
+                setResultCode(Activity.RESULT_CANCELED);
+                setResultData("ERROR: clipboard set failed: " + e.getMessage());
+                return;
+            } finally {
+                // Always clean up, even if clipboard set failed
+                f.delete();
             }
         } else if (ACTION_GET.equals(action) || ACTION_GET_SHORT.equals(action)) {
             try {

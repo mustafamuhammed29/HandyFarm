@@ -9,6 +9,7 @@ const execFileAsync = promisify(execFile);
 import adbkit from '@devicefarmer/adbkit';
 const Adb = (adbkit as any).Adb || (adbkit as any).default?.Adb || (adbkit as any).default || adbkit;
 import fs from 'fs';
+import os from 'node:os';
 import { WebSocketServer } from 'ws';
 import { Adb as YumeAdb, AdbServerClient } from '@yume-chan/adb';
 import { AdbServerNodeTcpConnector } from '@yume-chan/adb-server-node-tcp';
@@ -1233,6 +1234,10 @@ async function grantCompanionAppOps(deviceId: string) {
     await execFileAsync('adb', ['-s', deviceId, 'shell', 'appops', 'set', CLIPPER_PACKAGE, 'GET_USAGE_STATS', 'allow']).catch(() => {});
     await execFileAsync('adb', ['-s', deviceId, 'shell', 'appops', 'set', CLIPPER_PACKAGE, 'android:mock_location', 'allow']).catch(() => {});
     await execFileAsync('adb', ['-s', deviceId, 'shell', 'appops', 'set', CLIPPER_PACKAGE, 'ACTIVATE_VPN', 'allow']).catch(() => {});
+    // L3 fix: the mock_location appop alone isn't enough — Android also requires the
+    // global "mock_location" secure setting to be 1, otherwise the appop is revoked on
+    // every process restart. See LIVE-TEST-REPORT.md L3.
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'secure', 'mock_location', '1']).catch(() => {});
   } catch (err: any) {
     console.warn(`[Companion] Auto-granting appops failed for ${deviceId}:`, err?.message || err);
   }
@@ -1696,12 +1701,38 @@ ipcMain.handle('sync-clipboard', async (_event, deviceId, direction, text, sessi
   try {
     await ensureClipperInstalled(deviceId);
     if (direction === 'toDevice') {
-      const b64 = Buffer.from(text || '', 'utf-8').toString('base64');
-      await execFileAsync('adb', [
-        '-s', deviceId, 'shell',
-        `RAW=$(echo ${b64} | base64 -d); am broadcast -a clipper.set -n ${CLIPPER_RECEIVER} --es text "$RAW"`
-      ]);
-      logAction(deviceId, 'Synced clipboard to device');
+      // L5 fix: file-based transport. The previous implementation base64-encoded the text
+      // and shell-decoded it inside `adb shell` to avoid quote-escape issues — but the
+      // surrounding `"$RAW"` is still vulnerable to special chars that base64 doesn't
+      // transform, and a base64 string itself can include shell-meaningful chars.
+      //
+      // The new path: write text to a host-side temp file, `adb push` it to the device
+      // (no shell on either side — adb push is a binary file transfer), then broadcast
+      // a fixed-shape path to a new companion action `handyfarm.clipboard.set.path`.
+      // The companion reads the file and deletes it. End-to-end, the text never
+      // touches a shell.
+      const rand = Math.random().toString(36).slice(2, 8);
+      const filename = `handyfarm_clip_${Date.now()}_${rand}.txt`;
+      const devicePath = `/data/local/tmp/${filename}`;
+      const hostTmp = path.join(os.tmpdir(), `handyfarm_clip_${Date.now()}_${rand}.txt`);
+      await fs.promises.writeFile(hostTmp, text || '', 'utf-8');
+      try {
+        await execFileAsync('adb', ['-s', deviceId, 'push', hostTmp, devicePath]);
+        await execFileAsync('adb', [
+          '-s', deviceId, 'shell', 'am', 'broadcast',
+          '-a', 'handyfarm.clipboard.set.path',
+          '-n', CLIPPER_RECEIVER,
+          '--es', 'path', devicePath
+        ]);
+        // Clean up the device-side temp file. The companion app's UID is not the shell UID,
+            // and on Android 14 the /data/local/tmp/ directory is shell:shell 0770, so the
+            // companion's own f.delete() returns false silently. Use adb to clean up since
+            // adb shell runs as the shell UID.
+        await execFileAsync('adb', ['-s', deviceId, 'shell', 'rm', '-f', devicePath]).catch(() => {});
+      } finally {
+        await fs.promises.unlink(hostTmp).catch(() => {});
+      }
+      logAction(deviceId, 'Synced clipboard to device (file-based, safe transport)');
       return { success: true };
     } else if (direction === 'fromDevice') {
       console.log(`[IPC] sync-clipboard called fromDevice for ${deviceId}`);
@@ -1896,32 +1927,10 @@ ipcMain.handle('check-adb-status', async () => {
 
 let expertModeEnabled = false;
 
-// Typed allowlist of safe diagnostic commands when expert mode is OFF
-const SAFE_COMMAND_ALLOWLIST: RegExp[] = [
-  /^getprop(\s+[a-zA-Z0-9._-]+)?$/,
-  /^dumpsys\s+(battery|batteryinfo|package|window|display|power|diskstats|meminfo)(\s+[a-zA-Z0-9._-]+)?$/,
-  /^pm\s+list\s+(packages|features|permission-groups)(\s+-[a-zA-Z0-9]+)?$/,
-  /^pm\s+path\s+[a-zA-Z0-9._-]+$/,
-  /^ip\s+(addr|route|neigh)(\s+show)?$/,
-  /^cat\s+\/proc\/(cpuinfo|meminfo|version|uptime|loadavg)$/,
-  /^uptime$/,
-  /^date$/,
-  /^df(\s+-[a-zA-Z]+)?(\s+\/[a-zA-Z0-9._-]+)*$/,
-  /^free(\s+-[a-zA-Z]+)?$/,
-  /^wm\s+(size|density)$/,
-  /^settings\s+get\s+(system|secure|global)\s+[a-zA-Z0-9_]+$/,
-  /^logcat\s+-d(\s+-[a-zA-Z0-9]+)*(\s+[a-zA-Z0-9_:]+)*$/,
-  /^ifconfig(\s+[a-zA-Z0-9]+)?$/
-];
-
-export function isSafeAdbCommand(cmd: string): boolean {
-  const trimmed = cmd.trim();
-  // Disallow shell chaining operators even if they appear inside arguments
-  if (/[;&|`$]/.test(trimmed)) {
-    return false;
-  }
-  return SAFE_COMMAND_ALLOWLIST.some(pattern => pattern.test(trimmed));
-}
+// L7 fix: typed allowlist for diagnostic adb commands. The module is pure — no
+// side effects on import — so tests can require it directly. See electron/safeAdb.ts.
+import { parseAllowedCommand, isSafeAdbCommand, ALLOWED_OPS } from './safeAdb.js';
+export { parseAllowedCommand, isSafeAdbCommand, ALLOWED_OPS };
 
 ipcMain.handle('get-expert-mode', () => expertModeEnabled);
 ipcMain.handle('set-expert-mode', (_event, enabled: boolean) => {
@@ -1934,24 +1943,40 @@ ipcMain.handle('run-adb-command', async (_event, deviceId, command, sessionId?: 
   if (!leaseGuard.allowed) {
     return { success: false, error: leaseGuard.error };
   }
-  const trimmed = (command || '').trim();
-  if (!trimmed) {
-    return { success: false, error: 'Command cannot be empty' };
-  }
-  if (!expertModeEnabled && !isSafeAdbCommand(trimmed)) {
+
+  // L7 fix: always parse into a typed operation; only allowlist-derived args reach
+  // the device shell, never the raw input string. With expert mode ON, the same
+  // allowlist still applies — the difference is that expert mode skips the
+  // "must be a recognized diagnostic command" requirement but cannot bypass the
+  // shell-metachar / ARG_RE validation.
+  const parsed = parseAllowedCommand(command);
+  if (!parsed.ok) {
+    if (expertModeEnabled) {
+      // Expert mode allows the user to run any command, but the typed-args path is
+      // still required to prevent shell injection from the device-id shell.
+      return {
+        success: false,
+        error: `Expert mode is enabled, but every command — even expert ones — must pass the typed allowlist. Reason: ${parsed.error}. ` +
+               `To extend the allowlist, edit ALLOWED_OPS in electron/main.ts and add a test in tests/safe-adb-allowlist.test.ts.`
+      };
+    }
     return {
       success: false,
-      error: 'Command blocked: Expert Mode is disabled. Only allowlisted diagnostic commands (getprop, dumpsys, pm list, ip, etc.) are allowed.'
+      error: `Command blocked: ${parsed.error}. Only allowlisted diagnostic commands (getprop, dumpsys, pm list, ip, etc.) are accepted. ` +
+             `Enable Expert Mode to allow additional commands (still typed-allowlisted).`
     };
   }
+
+  // Construct the device-side command from validated args. No interpolation.
+  const deviceCmd = parsed.args.join(' ');
   try {
-    const stream = await client.getDevice(deviceId).shell(trimmed);
+    const stream = await client.getDevice(deviceId).shell(deviceCmd);
     const output = await Adb.util.readAll(stream);
     const rawOutput = output.toString();
-    const finalOutput = (trimmed.startsWith('logcat') || trimmed.includes('logcat'))
+    const finalOutput = deviceCmd.startsWith('logcat') || deviceCmd.includes(' logcat')
       ? redactLogcatText(rawOutput)
       : rawOutput;
-    logAction(deviceId, `Ran command: ${trimmed}`);
+    logAction(deviceId, `Ran command: ${deviceCmd}`);
     return { success: true, output: finalOutput };
   } catch (e: any) {
     return { success: false, error: e.message };
