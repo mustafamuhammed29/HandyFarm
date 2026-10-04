@@ -49,6 +49,30 @@ export interface DeviceDelta {
   removed?: boolean;
 }
 
+export interface VpnConfig {
+  targetPackage: string;
+  serverEndpoint: string;
+  clientPrivateKey: string;
+  serverPublicKey: string;
+  clientIp?: string;
+  allowedIp?: string;
+  dns?: string;
+  mtu?: number;
+}
+
+export interface VpnStatus {
+  status: 'CONNECTED' | 'DISCONNECTED' | 'CONNECTING' | 'ERROR';
+  targetPackage?: string;
+  serverEndpoint?: string;
+  tunnelIp?: string;
+  handle?: number;
+  uptimeMs?: number;
+  splitTunnel?: boolean;
+  backendLoaded?: boolean;
+  backendVersion?: string;
+  error?: string;
+}
+
 declare global {
   interface Window {
     electronAPI: {
@@ -69,6 +93,14 @@ declare global {
       takeScreenshot: (deviceId: string) => Promise<{success: boolean, path?: string, error?: string}>;
       
       syncClipboard: (deviceId: string, direction: 'toDevice' | 'fromDevice', text?: string, sessionId?: string) => Promise<{success: boolean, text?: string, error?: string}>;
+      getCompanionIdentity: (deviceId: string) => Promise<string | null>;
+      getForegroundApp: (deviceId: string) => Promise<{success: boolean, packageName?: string, error?: string, permissionRequired?: boolean}>;
+      setMockLocation: (deviceId: string, lat: number, lng: number) => Promise<{success: boolean, error?: string, permissionRequired?: boolean}>;
+      getMockLocation: (deviceId: string) => Promise<{success: boolean, lat?: number, lng?: number, mockAllowed?: boolean, error?: string}>;
+      resetDeviceToBaseline: (deviceId: string) => Promise<{success: boolean, companionReport?: any, elevatedAdbActions?: string[], error?: string}>;
+      connectVpn: (deviceId: string, config: VpnConfig) => Promise<{success: boolean, status?: VpnStatus, error?: string}>;
+      disconnectVpn: (deviceId: string) => Promise<{success: boolean, status?: VpnStatus, error?: string}>;
+      getVpnStatus: (deviceId: string) => Promise<{success: boolean, status?: VpnStatus, error?: string}>;
       sendText: (deviceId: string, text: string, sessionId?: string) => Promise<{success: boolean, error?: string}>;
       pushFile: (deviceId: string, localPath: string, remotePath: string, sessionId?: string) => Promise<{success: boolean, error?: string}>;
       pullFile: (deviceId: string, remotePath: string, localPath: string) => Promise<{success: boolean, error?: string}>;

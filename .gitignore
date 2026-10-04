@@ -25,3 +25,9 @@ dist-release
 *.njsproj
 *.sln
 *.sw?
+
+# Android build outputs
+handyfarm-clipper/build/
+handyfarm-clipper/.gradle/
+scratch/adversary/build/
+

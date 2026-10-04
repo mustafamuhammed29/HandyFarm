@@ -96,12 +96,27 @@ async function updateDeviceData() {
     manufacturer = manufacturer || 'Unknown';
     serial       = serial       || (deviceId.includes(':') ? '' : deviceId);
 
+    // Query companion app UUID if hardware serials are empty or suspect
+    let companionUuid: string | undefined = undefined;
+    const isSuspectVal = (s?: string) => !s || s.trim().toLowerCase() === 'unknown' || s.trim().toLowerCase() === '0123456789abcdef' || s.trim().length < 3;
+    if (isSuspectVal(bootSerial) && isSuspectVal(serial)) {
+      try {
+        const out = await getShellOutput('am broadcast -a handyfarm.identity.get -n com.handyfarm.clipper/.ClipperReceiver');
+        const m = out.match(/data="([a-f0-9\-]+)"/i);
+        if (m && m[1]) {
+          companionUuid = m[1];
+          console.log(`[Worker ${deviceId}] Retrieved companion identity UUID: ${companionUuid}`);
+        }
+      } catch {}
+    }
+
     // Compute stable hardware physicalDeviceId
     const physicalDeviceId = generatePhysicalDeviceId({
       bootSerial,
       serial: serial || undefined,
       productDevice,
       buildFingerprint,
+      companionUuid,
     });
 
     // Detect IP address

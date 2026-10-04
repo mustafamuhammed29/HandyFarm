@@ -1290,14 +1290,24 @@ ipcMain.handle('take-screenshot', async (_event, deviceId) => {
   }
 });
 
-// TODO(clipper-security-debt): bringClipperToFocus() visibly steals screen focus during every clipboard read on Android 10+ (API 29+). This is accepted as a temporary tradeoff.
+const CLIPPER_PACKAGE = 'com.handyfarm.clipper';
+const CLIPPER_RECEIVER = `${CLIPPER_PACKAGE}/.ClipperReceiver`;
+const CLIPPER_MAIN = `${CLIPPER_PACKAGE}/.Main`;
+
+// NOTE(clipper-foreground): Android 10+ (API 29+) requires window focus to read clipboard data.
+// com.handyfarm.clipper/.Main uses a 100% invisible/translucent theme (no animation/UI) to briefly
+// acquire focus for reading without visible screen disruption, then dismisses via KEYCODE_BACK.
 async function bringClipperToFocus(deviceId: string) {
-  await execFileAsync('adb', ['-s', deviceId, 'shell', 'am', 'start', '-W', '-n', 'ca.zgrs.clipper/.Main']).catch(() => {});
-  await new Promise(r => setTimeout(r, 350));
-  const { stdout } = await execFileAsync('adb', ['-s', deviceId, 'shell', 'dumpsys', 'window']).catch(() => ({ stdout: '' }));
-  if (stdout.includes('DeprecatedTargetSdkVersionDialog')) {
-    await execFileAsync('adb', ['-s', deviceId, 'shell', 'input', 'keyevent', '4']).catch(() => {});
-    await new Promise(r => setTimeout(r, 250));
+  await execFileAsync('adb', ['-s', deviceId, 'shell', 'am', 'start', '-W', '-n', CLIPPER_MAIN]).catch(() => {});
+}
+
+async function grantCompanionAppOps(deviceId: string) {
+  try {
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'appops', 'set', CLIPPER_PACKAGE, 'GET_USAGE_STATS', 'allow']).catch(() => {});
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'appops', 'set', CLIPPER_PACKAGE, 'android:mock_location', 'allow']).catch(() => {});
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'appops', 'set', CLIPPER_PACKAGE, 'ACTIVATE_VPN', 'allow']).catch(() => {});
+  } catch (err: any) {
+    console.warn(`[Companion] Auto-granting appops failed for ${deviceId}:`, err?.message || err);
   }
 }
 
@@ -1305,18 +1315,19 @@ async function ensureClipperInstalled(deviceId: string) {
   const clipperPath = getResourcePath('clipper.apk');
   if (!fs.existsSync(clipperPath)) return;
   try {
-    const stream = await client.getDevice(deviceId).shell('pm path ca.zgrs.clipper');
+    const stream = await client.getDevice(deviceId).shell(`pm path ${CLIPPER_PACKAGE}`);
     const out = (await Adb.util.readAll(stream)).toString();
     if (!out.includes('package:')) {
-      console.log(`[Clipper] Installing clipper.apk on ${deviceId} from ${clipperPath}...`);
-      // TODO(clipper-security-debt): clipper.apk (majido/clipper, ca.zgrs.clipper) requires package_verifier_enable=0 and verifier_verify_adb_installs=0 to install (disabling Play Protect verification system-wide on the device, not just for this app). This is accepted as a temporary tradeoff.
-      await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'global', 'verifier_verify_adb_installs', '0']).catch(() => {});
-      await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'global', 'package_verifier_enable', '0']).catch(() => {});
+      console.log(`[Clipper] Installing first-party clipper.apk on ${deviceId} from ${clipperPath}...`);
+      // First-party com.handyfarm.clipper targets modern SDK 34 and is signed with v2/v3 schemes.
+      // Play Protect verification bypass is no longer required.
       try {
-        await execFileAsync('adb', ['-s', deviceId, 'install', '-r', '-d', '-g', '--bypass-low-target-sdk-block', clipperPath]);
+        await execFileAsync('adb', ['-s', deviceId, 'install', '-r', '-d', '-g', clipperPath]);
       } catch {
         await client.getDevice(deviceId).install(clipperPath);
       }
+      // Automate appops grants on fresh install so no manual per-device intervention is required
+      await grantCompanionAppOps(deviceId);
       // Launch once to move package out of stopped state, then dismiss
       await bringClipperToFocus(deviceId);
       await execFileAsync('adb', ['-s', deviceId, 'shell', 'input', 'keyevent', '4']).catch(() => {});
@@ -1325,6 +1336,316 @@ async function ensureClipperInstalled(deviceId: string) {
     console.warn(`[Clipper] Auto-install check failed for ${deviceId}:`, err?.message || err);
   }
 }
+
+async function getCompanionIdentity(deviceId: string): Promise<string | null> {
+  try {
+    await ensureClipperInstalled(deviceId);
+    const stream = await client.getDevice(deviceId).shell(`am broadcast -a handyfarm.identity.get -n ${CLIPPER_RECEIVER}`);
+    const buffer = await Adb.util.readAll(stream);
+    const output = buffer.toString();
+    const match = output.match(/data="([a-f0-9\-]+)"/i);
+    return match ? match[1] : null;
+  } catch (err: any) {
+    console.warn(`[Clipper] getCompanionIdentity failed for ${deviceId}:`, err?.message || err);
+    return null;
+  }
+}
+
+ipcMain.handle('get-companion-identity', async (_event, deviceId: string) => {
+  return await getCompanionIdentity(deviceId);
+});
+
+async function getForegroundApp(deviceId: string): Promise<{ success: boolean; packageName?: string; error?: string; permissionRequired?: boolean }> {
+  try {
+    await ensureClipperInstalled(deviceId);
+    const stream = await client.getDevice(deviceId).shell(`am broadcast -a handyfarm.foreground.get -n ${CLIPPER_RECEIVER}`);
+    const buffer = await Adb.util.readAll(stream);
+    const output = buffer.toString();
+    const match = output.match(/data="(.*)"/s);
+    if (!match || !match[1]) {
+      return { success: false, error: 'Failed to read broadcast output from companion app' };
+    }
+    const data = match[1].trim();
+    if (data.startsWith('STATUS_PERMISSION_REQUIRED')) {
+      // Auto-remediation: attempt granting via ADB and retry once automatically
+      console.log(`[Companion] Auto-granting GET_USAGE_STATS via ADB for ${deviceId}...`);
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'appops', 'set', CLIPPER_PACKAGE, 'GET_USAGE_STATS', 'allow']).catch(() => {});
+      const retryStream = await client.getDevice(deviceId).shell(`am broadcast -a handyfarm.foreground.get -n ${CLIPPER_RECEIVER}`);
+      const retryBuffer = await Adb.util.readAll(retryStream);
+      const retryMatch = retryBuffer.toString().match(/data="(.*)"/s);
+      const retryData = retryMatch ? retryMatch[1].trim() : '';
+      if (!retryData.startsWith('STATUS_PERMISSION_REQUIRED') && retryData.length > 0) {
+        return { success: true, packageName: retryData };
+      }
+      return {
+        success: false,
+        permissionRequired: true,
+        error: 'PACKAGE_USAGE_STATS permission is required. Enable via Settings -> Apps -> Special app access -> Usage access, or run: adb shell appops set com.handyfarm.clipper GET_USAGE_STATS allow'
+      };
+    }
+    return { success: true, packageName: data };
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
+}
+
+ipcMain.handle('get-foreground-app', async (_event, deviceId: string) => {
+  return await getForegroundApp(deviceId);
+});
+
+async function setMockLocation(deviceId: string, lat: number, lng: number): Promise<{ success: boolean; error?: string; permissionRequired?: boolean }> {
+  try {
+    await ensureClipperInstalled(deviceId);
+    const stream = await client.getDevice(deviceId).shell(`am broadcast -a handyfarm.location.set -n ${CLIPPER_RECEIVER} --ef lat ${lat} --ef lng ${lng}`);
+    const buffer = await Adb.util.readAll(stream);
+    const output = buffer.toString();
+    const match = output.match(/data="(.*)"/s);
+    if (!match || !match[1]) {
+      return { success: false, error: 'Failed to read broadcast output from companion app' };
+    }
+    const data = match[1].trim();
+    if (data.startsWith('STATUS_PERMISSION_REQUIRED')) {
+      // Auto-remediation: attempt granting via ADB and retry once automatically
+      console.log(`[Companion] Auto-granting android:mock_location via ADB for ${deviceId}...`);
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'appops', 'set', CLIPPER_PACKAGE, 'android:mock_location', 'allow']).catch(() => {});
+      const retryStream = await client.getDevice(deviceId).shell(`am broadcast -a handyfarm.location.set -n ${CLIPPER_RECEIVER} --ef lat ${lat} --ef lng ${lng}`);
+      const retryBuffer = await Adb.util.readAll(retryStream);
+      const retryMatch = retryBuffer.toString().match(/data="(.*)"/s);
+      const retryData = retryMatch ? retryMatch[1].trim() : '';
+      if (retryData.startsWith('OK:')) {
+        return { success: true };
+      }
+      return {
+        success: false,
+        permissionRequired: true,
+        error: retryData || data
+      };
+    }
+    if (data.startsWith('ERROR:')) {
+      return { success: false, error: data };
+    }
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
+}
+
+ipcMain.handle('set-mock-location', async (_event, deviceId: string, lat: number, lng: number) => {
+  return await setMockLocation(deviceId, lat, lng);
+});
+
+async function getMockLocation(deviceId: string): Promise<{ success: boolean; lat?: number; lng?: number; mockAllowed?: boolean; error?: string }> {
+  try {
+    await ensureClipperInstalled(deviceId);
+    const stream = await client.getDevice(deviceId).shell(`am broadcast -a handyfarm.location.get -n ${CLIPPER_RECEIVER}`);
+    const buffer = await Adb.util.readAll(stream);
+    const output = buffer.toString();
+    const match = output.match(/data="(.*)"/s);
+    if (!match || !match[1]) {
+      return { success: false, error: 'Failed to read broadcast output from companion app' };
+    }
+    const data = match[1].trim();
+    const mockAllowed = data.includes('mock_allowed=true');
+    const latMatch = data.match(/lat=([\-0-9\.]+)/);
+    const lngMatch = data.match(/lng=([\-0-9\.]+)/);
+    return {
+      success: true,
+      lat: latMatch ? parseFloat(latMatch[1]) : undefined,
+      lng: lngMatch ? parseFloat(lngMatch[1]) : undefined,
+      mockAllowed
+    };
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
+}
+
+ipcMain.handle('get-mock-location', async (_event, deviceId: string) => {
+  return await getMockLocation(deviceId);
+});
+
+async function resetDeviceToBaseline(deviceId: string): Promise<{
+  success: boolean;
+  companionReport?: any;
+  elevatedAdbActions?: string[];
+  error?: string;
+}> {
+  try {
+    await ensureClipperInstalled(deviceId);
+
+    // 1. Ask companion app to perform standalone resets and report drift
+    const stream = await client.getDevice(deviceId).shell(`am broadcast -a handyfarm.reset.baseline -n ${CLIPPER_RECEIVER}`);
+    const buffer = await Adb.util.readAll(stream);
+    const output = buffer.toString();
+    const prefix = 'data="';
+    const s = output.indexOf(prefix);
+    let companionReport: any = null;
+    if (s !== -1) {
+      const jsonStart = s + prefix.length;
+      const jsonEnd = output.lastIndexOf('}"');
+      if (jsonEnd > jsonStart) {
+        const jsonStr = output.substring(jsonStart, jsonEnd + 1);
+        try {
+          companionReport = JSON.parse(jsonStr);
+        } catch {
+          companionReport = { raw: jsonStr };
+        }
+      }
+    }
+
+    // 2. Perform elevated ADB resets that companion app legitimately lacks permission to perform
+    const elevatedAdbActions: string[] = [];
+
+    // Reset window and transition animations via ADB settings
+    try {
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'global', 'window_animation_scale', '0']);
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'global', 'transition_animation_scale', '0']);
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'global', 'animator_duration_scale', '0']);
+      elevatedAdbActions.push('animations_disabled_via_adb');
+    } catch (e: any) {
+      console.warn(`[ResetBaseline] Failed to set animation scales via ADB on ${deviceId}:`, e?.message);
+    }
+
+    // Dismiss system dialogs and return to home screen
+    try {
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'am', 'broadcast', '-a', 'android.intent.action.CLOSE_SYSTEM_DIALOGS']).catch(() => {});
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'input', 'keyevent', '3']).catch(() => {});
+      elevatedAdbActions.push('system_dialogs_and_home_dismissed_via_adb');
+    } catch (e: any) {
+      console.warn(`[ResetBaseline] Failed to close dialogs via ADB on ${deviceId}:`, e?.message);
+    }
+
+    return {
+      success: true,
+      companionReport,
+      elevatedAdbActions
+    };
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
+}
+
+ipcMain.handle('reset-device-to-baseline', async (_event, deviceId: string) => {
+  return await resetDeviceToBaseline(deviceId);
+});
+
+async function getVpnStatus(deviceId: string): Promise<{ success: boolean; status?: any; error?: string }> {
+  try {
+    await ensureClipperInstalled(deviceId);
+    const stream = await client.getDevice(deviceId).shell(`am broadcast -a handyfarm.vpn.status -n ${CLIPPER_RECEIVER}`);
+    const buffer = await Adb.util.readAll(stream);
+    const output = buffer.toString();
+    const match = output.match(/data="(.*)"/s);
+    if (!match || !match[1]) {
+      return { success: false, error: 'Failed to read VPN status from companion app' };
+    }
+    try {
+      const parsed = JSON.parse(match[1]);
+      return { success: true, status: parsed };
+    } catch {
+      return { success: true, status: { raw: match[1] } };
+    }
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
+}
+
+async function connectVpn(deviceId: string, config: {
+  targetPackage: string;
+  serverEndpoint: string;
+  clientPrivateKey: string;
+  serverPublicKey: string;
+  clientIp?: string;
+  allowedIp?: string;
+  dns?: string;
+  mtu?: number;
+}): Promise<{ success: boolean; status?: any; error?: string }> {
+  try {
+    await ensureClipperInstalled(deviceId);
+    if (!config || !config.targetPackage) {
+      return { success: false, error: 'Missing targetPackage in VPN configuration' };
+    }
+    if (!config.serverEndpoint) {
+      return { success: false, error: 'Missing serverEndpoint in VPN configuration' };
+    }
+    if (!config.clientPrivateKey || !config.serverPublicKey) {
+      return { success: false, error: 'Missing clientPrivateKey or serverPublicKey in VPN configuration' };
+    }
+
+    // Hard requirement: prevent self-lockout of adb shell and companion agent
+    if (config.targetPackage === 'com.android.shell' || config.targetPackage === CLIPPER_PACKAGE) {
+      return { success: false, error: 'Self-lockout prevented: cannot route ADB shell or companion agent through VPN' };
+    }
+
+    // Build broadcast command
+    const args = [
+      '-s', deviceId, 'shell', 'am', 'broadcast',
+      '-a', 'handyfarm.vpn.connect',
+      '-n', CLIPPER_RECEIVER,
+      '--es', 'target_package', config.targetPackage,
+      '--es', 'server_endpoint', config.serverEndpoint,
+      '--es', 'client_private_key', config.clientPrivateKey,
+      '--es', 'server_public_key', config.serverPublicKey
+    ];
+    if (config.clientIp) {
+      args.push('--es', 'client_ip', config.clientIp);
+    }
+    if (config.allowedIp) {
+      args.push('--es', 'allowed_ip', config.allowedIp);
+    }
+    if (config.dns) {
+      args.push('--es', 'dns', config.dns);
+    }
+    if (config.mtu) {
+      args.push('--ei', 'mtu', String(config.mtu));
+    }
+
+    const { stdout } = await execFileAsync('adb', args);
+    if (stdout.includes('STATUS_PERMISSION_REQUIRED')) {
+      console.log(`[Companion] Auto-granting ACTIVATE_VPN via ADB for ${deviceId}...`);
+      await execFileAsync('adb', ['-s', deviceId, 'shell', 'appops', 'set', CLIPPER_PACKAGE, 'ACTIVATE_VPN', 'allow']).catch(() => {});
+      // Retry broadcast
+      await execFileAsync('adb', args);
+    }
+
+    // Wait briefly for tunnel activation and query status
+    await new Promise(r => setTimeout(r, 1000));
+    const statusRes = await getVpnStatus(deviceId);
+    if (statusRes.success && statusRes.status?.status === 'CONNECTED') {
+      logAction(deviceId, `Connected VPN tunnel for ${config.targetPackage} -> ${config.serverEndpoint}`);
+      return { success: true, status: statusRes.status };
+    } else if (statusRes.status?.status === 'ERROR') {
+      return { success: false, status: statusRes.status, error: statusRes.status?.error || 'VPN connection failed' };
+    }
+    return { success: true, status: statusRes.status };
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
+}
+
+async function disconnectVpn(deviceId: string): Promise<{ success: boolean; status?: any; error?: string }> {
+  try {
+    await ensureClipperInstalled(deviceId);
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'am', 'broadcast', '-a', 'handyfarm.vpn.disconnect', '-n', CLIPPER_RECEIVER]);
+    await new Promise(r => setTimeout(r, 500));
+    const statusRes = await getVpnStatus(deviceId);
+    logAction(deviceId, 'Disconnected VPN tunnel');
+    return { success: true, status: statusRes.status };
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
+}
+
+ipcMain.handle('connect-vpn', async (_event, deviceId: string, config: any) => {
+  return await connectVpn(deviceId, config);
+});
+
+ipcMain.handle('disconnect-vpn', async (_event, deviceId: string) => {
+  return await disconnectVpn(deviceId);
+});
+
+ipcMain.handle('get-vpn-status', async (_event, deviceId: string) => {
+  return await getVpnStatus(deviceId);
+});
 
 ipcMain.handle('sync-clipboard', async (_event, deviceId, direction, text, sessionId?: string) => {
   const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
@@ -1337,7 +1658,7 @@ ipcMain.handle('sync-clipboard', async (_event, deviceId, direction, text, sessi
       const b64 = Buffer.from(text || '', 'utf-8').toString('base64');
       await execFileAsync('adb', [
         '-s', deviceId, 'shell',
-        `RAW=$(echo ${b64} | base64 -d); am broadcast -a clipper.set -n ca.zgrs.clipper/.ClipperReceiver --es text "$RAW"`
+        `RAW=$(echo ${b64} | base64 -d); am broadcast -a clipper.set -n ${CLIPPER_RECEIVER} --es text "$RAW"`
       ]);
       logAction(deviceId, 'Synced clipboard to device');
       return { success: true };
@@ -1346,7 +1667,7 @@ ipcMain.handle('sync-clipboard', async (_event, deviceId, direction, text, sessi
       // On Android 10+ (API 29+), reading clipboard requires the helper app to have foreground focus
       await bringClipperToFocus(deviceId);
 
-      const stream = await client.getDevice(deviceId).shell('am broadcast -a clipper.get -n ca.zgrs.clipper/.ClipperReceiver');
+      const stream = await client.getDevice(deviceId).shell(`am broadcast -a clipper.get -n ${CLIPPER_RECEIVER}`);
       const buffer = await Adb.util.readAll(stream);
       const output = buffer.toString();
 
