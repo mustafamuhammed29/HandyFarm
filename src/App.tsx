@@ -10,6 +10,7 @@ import type { DeviceData, QuickPhrase, TestAccount } from './types';
 import { LiveViewPoc } from './components/LiveViewPoc';
 import type { LiveViewPocRef } from './components/LiveViewPoc';
 import { LogcatViewer } from './components/LogcatViewer';
+import { ClipperPanel } from './components/ClipperPanel';
 
 function App() {
   const [devices, setDevices] = useState<DeviceData[]>([]);
@@ -792,6 +793,21 @@ function App() {
             )}
           </div>
 
+        <div className="action-section">
+            <div style={{display:'flex', alignItems:'center', gap:'8px', cursor: 'pointer', userSelect: 'none'}} onClick={() => toggleSection('Clipper Companion')}>
+              {expandedSections.has('Clipper Companion') ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+              <span style={{fontWeight: '500'}}>Clipper Companion</span>
+            </div>
+            {expandedSections.has('Clipper Companion') && (
+              <div style={{display: 'flex', flexDirection: 'column', gap: '8px', background: 'var(--bg-color)', padding: '12px', borderRadius: '8px', marginTop: '12px'}}>
+                <ClipperPanel
+                  devices={devices}
+                  selectedDeviceId={focusedDeviceId || singleTargetId || ''}
+                  onSelectDevice={(id) => setSingleTargetId(id)}
+                />
+              </div>
+            )}
+          </div>
         </div>
       </aside>
 

@@ -140,6 +140,10 @@ declare global {
       setDeviceLeaseState?: (physicalDeviceId: string, state: LeaseState, sessionId?: string) => Promise<{ success: boolean; error?: string }>;
       getExpertMode?: () => Promise<boolean>;
       setExpertMode?: (enabled: boolean) => Promise<{ success: boolean; expertMode: boolean }>;
+
+      // Clipper Companion Control Panel
+      getClipperInfo?: (deviceId: string) => Promise<{ installed: boolean; version?: string; firstInstallTime?: string; lastUpdateTime?: string; error?: string }>;
+      installClipper?: (deviceId: string) => Promise<{ installed: boolean; version?: string; error?: string }>;
     };
   }
 }

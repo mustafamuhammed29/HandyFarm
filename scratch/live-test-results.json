@@ -1,0 +1,253 @@
+[
+  {
+    "name": "GET /devices lists our device",
+    "ok": true,
+    "ms": 22,
+    "http": 200,
+    "body": {
+      "count": 4,
+      "found": true
+    }
+  },
+  {
+    "name": "GET /sims (LycaMobile DE on this device)",
+    "ok": true,
+    "ms": 2,
+    "http": 200,
+    "body": {
+      "count": 1,
+      "sim": {
+        "id": "sim_lyca_tecno01",
+        "carrier": "LycaMobile DE",
+        "status": "active"
+      }
+    }
+  },
+  {
+    "name": "GET /devices/:id/egress/history (returns empty array — never resolved a public IP)",
+    "ok": true,
+    "ms": 1,
+    "http": 200,
+    "body": {
+      "count": 0
+    }
+  },
+  {
+    "name": "POST preflight/network (Wi-Fi OFF → NO_ACTIVE_NETWORK)",
+    "ok": true,
+    "ms": 3189,
+    "http": 412,
+    "body": {
+      "passed": false,
+      "deviceId": "106293738O006649",
+      "physicalDeviceId": "phys_106293738O006649",
+      "runId": "run_1791132659636",
+      "checks": [
+        {
+          "check": "dual_transport_cellular_route",
+          "passed": false,
+          "message": "NO_ACTIVE_NETWORK: No active default network detected (dumpsys connectivity reports \"Active default network: none\"). The modem has no data connection; the wifi_on and mobile_data settings alone do not prove that a cellular network exists. Verify SIM registration (adb shell getprop gsm.operator.numeric) and data state (adb shell dumpsys telephony.registry) before running network-sensitive tests.",
+          "details": {
+            "isCellularDefault": false,
+            "activeTransport": "unknown",
+            "wifiEnabled": false,
+            "mobileDataEnabled": true,
+            "reason": "NO_ACTIVE_NETWORK: No active default network detected (dumpsys connectivity reports \"Active default network: none\"). The modem has no data connection; the wifi_on and mobile_data settings alone do not prove that a cellular network exists. Verify SIM registration (adb shell getprop gsm.operator.numeric) and data state (adb shell dumpsys telephony.registry) before running network-sensitive tests."
+          }
+        }
+      ],
+      "error": "NO_ACTIVE_NETWORK: No active default network detected (dumpsys connectivity reports \"Active default network: none\"). The modem has no data connection; the wifi_on and mobile_data settings alone do not prove that a cellular network exists. Verify SIM registration (adb shell getprop gsm.operator.numeric) and data state (adb shell dumpsys telephony.registry) before running network-sensitive tests.",
+      "timestamp": 1791132659735
+    }
+  },
+  {
+    "name": "POST preflight/network (Wi-Fi ON → DUAL_TRANSPORT_VIOLATION)",
+    "ok": true,
+    "ms": 5242,
+    "http": 412,
+    "body": {
+      "passed": false,
+      "deviceId": "106293738O006649",
+      "physicalDeviceId": "phys_106293738O006649",
+      "runId": "run_1791132664826",
+      "checks": [
+        {
+          "check": "dual_transport_cellular_route",
+          "passed": false,
+          "message": "DUAL_TRANSPORT_VIOLATION: Wi-Fi is enabled on-device (wifi_on=1, active transport: WIFI). For cellular-egress testing, ADB must remain on USB and Wi-Fi must be disabled on-device (e.g. adb shell svc wifi disable) to prevent Android from silently routing app traffic over Wi-Fi.",
+          "details": {
+            "isCellularDefault": false,
+            "activeTransport": "wifi",
+            "wifiEnabled": true,
+            "mobileDataEnabled": true,
+            "reason": "DUAL_TRANSPORT_VIOLATION: Wi-Fi is enabled on-device (wifi_on=1, active transport: WIFI). For cellular-egress testing, ADB must remain on USB and Wi-Fi must be disabled on-device (e.g. adb shell svc wifi disable) to prevent Android from silently routing app traffic over Wi-Fi."
+          }
+        }
+      ],
+      "error": "DUAL_TRANSPORT_VIOLATION: Wi-Fi is enabled on-device (wifi_on=1, active transport: WIFI). For cellular-egress testing, ADB must remain on USB and Wi-Fi must be disabled on-device (e.g. adb shell svc wifi disable) to prevent Android from silently routing app traffic over Wi-Fi.",
+      "timestamp": 1791132664924
+    }
+  },
+  {
+    "name": "POST /devices/:physId/lease acquire",
+    "ok": false,
+    "ms": 2,
+    "http": 409,
+    "body": {
+      "success": false,
+      "error": "Device is currently leased by session 'live-test-pass' until 18:54:16"
+    }
+  },
+  {
+    "name": "POST /devices/:physId/heartbeat",
+    "ok": false,
+    "ms": 1,
+    "http": 409,
+    "body": {
+      "success": false,
+      "error": "No active lease held by this session"
+    }
+  },
+  {
+    "name": "GET /devices/:id/baseline/verify",
+    "ok": true,
+    "ms": 1231,
+    "http": 200,
+    "body": {
+      "success": true,
+      "result": {
+        "verified": true,
+        "deviceId": "106293738O006649",
+        "physicalDeviceId": "phys_106293738O006649",
+        "capturedAt": 1791132557256,
+        "verifiedAt": 1791132664983,
+        "diffs": [],
+        "clockVerification": {
+          "offsetMs": -505,
+          "bounded": true,
+          "autoTimeEnabled": true,
+          "deviceEpochMs": 1791132664528,
+          "hostEpochMs": 1791132665033
+        }
+      }
+    }
+  },
+  {
+    "name": "POST /devices/:id/baseline/reset (blocked by our own lease — guard working)",
+    "ok": true,
+    "ms": 2,
+    "http": 403,
+    "body": {
+      "success": false,
+      "error": "Device is leased by session 'live-test-pass' until 18:54:16. Exclusive action rejected."
+    }
+  },
+  {
+    "name": "DELETE /devices/:physId/lease release",
+    "ok": false,
+    "ms": 2,
+    "http": 409,
+    "body": {
+      "success": false,
+      "error": "Cannot release lease held by session 'live-test-pass'"
+    }
+  },
+  {
+    "name": "GET /devices after release — state should reflect cooling_down or available",
+    "ok": true,
+    "ms": 0,
+    "http": 200,
+    "body": {
+      "id": "106293738O006649",
+      "leaseState": "leased"
+    }
+  },
+  {
+    "name": "CLI: handyfarm devices list",
+    "ok": true,
+    "ms": 77,
+    "http": 0,
+    "body": "\nHandyFarm Devices (4):\n\nSTATUS     DEVICE ID                  PHYSICAL ID                  MODEL            LEASE STATE    LEASED BY\n---------------------------------------------------------------------------------------------------------------------------\noffline    11160b2a51ec0a02           phys"
+  },
+  {
+    "name": "CLI: lease cycle (lease → heartbeat → release)",
+    "ok": false,
+    "ms": 64,
+    "body": "Command failed: node C:\\Users\\musta\\Desktop\\HandyFarm\\bin\\handyfarm.js lease --device phys_106293738O006649 --session cli-cycle-test --ttl 2m\n\n[Lease Error] (409): Device is currently leased by session 'live-test-pass' until 18:54:16\n\n"
+  },
+  {
+    "name": "Companion clipboard sync (push broadcast)",
+    "ok": true,
+    "ms": 115,
+    "http": 0,
+    "body": "Broadcasting: Intent { act=clipper.set flg=0x400000 cmp=com.handyfarm.clipper/.ClipperReceiver (has extras) }\r\nBroadcast completed: result=-1, data=\"Text is copied into clipboard.\"\r\n"
+  },
+  {
+    "name": "Companion clipboard sync (pull broadcast)",
+    "ok": [
+      "data=\"\"",
+      ""
+    ],
+    "ms": 92,
+    "http": 0,
+    "body": "data=\"\""
+  },
+  {
+    "name": "Companion identity UUID round-trip (must be stable across calls)",
+    "ok": true,
+    "ms": 139,
+    "http": 0,
+    "body": "uuid=72f15acb-f218-4f7b-84a9-ff3a338e762f"
+  },
+  {
+    "name": "Companion mock-location set (expect permission-required response on this device)",
+    "ok": true,
+    "ms": 79,
+    "http": 0,
+    "body": "Broadcasting: Intent { act=handyfarm.location.set flg=0x400000 cmp=com.handyfarm.clipper/.ClipperReceiver (has extras) }\r\nBroadcast completed: result=-1, data=\"STATUS_PERMISSION_REQUIRED: MOCK_LOCATION (Set mock location app in Developer Options or run: adb shell appops set com.handyfarm.clipper MOC"
+  },
+  {
+    "name": "Companion foreground-app query",
+    "ok": true,
+    "ms": 87,
+    "http": 0,
+    "body": "fg=com.android.settings.intelligence"
+  },
+  {
+    "name": "Companion VPN status (expect DISCONNECTED — no peer)",
+    "ok": true,
+    "ms": 82,
+    "http": 0,
+    "body": "Broadcasting: Intent { act=handyfarm.vpn.status flg=0x400000 cmp=com.handyfarm.clipper/.ClipperReceiver }\r\nBroadcast completed: result=-1, data=\"{\"status\":\"DISCONNECTED\",\"target_package\":\"\",\"server_endpoint\":\"\",\"tunnel_ip\":\"\",\"handle\":-1,\"uptime_ms\":0,\"split_tunnel\":true,\"backend_loaded\":true,\"backe"
+  },
+  {
+    "name": "Companion reset-baseline broadcast",
+    "ok": [
+      "status"
+    ],
+    "ms": 109,
+    "http": 0,
+    "body": "Broadcasting: Intent { act=handyfarm.reset.baseline flg=0x400000 cmp=com.handyfarm.clipper/.ClipperReceiver }\r\nBroadcast completed: result=-1, data=\"{\"status\":\"OK\",\"standalone_success\":[\"mock_location_cleared\",\"clipboard_cleared\"],\"adb_required\":[\"close_system_dialogs (requires BROADCAST_CLOSE_SYSTE"
+  },
+  {
+    "name": "Companion package info via dumpsys",
+    "ok": true,
+    "ms": 65,
+    "http": 0,
+    "body": "version=1.0"
+  },
+  {
+    "name": "Robustness: unknown companion action — should not crash",
+    "ok": true,
+    "ms": 91,
+    "http": 0,
+    "body": "Broadcasting: Intent { act=handyfarm.nonexistent.action flg=0x400000 cmp=com.handyfarm.clipper/.ClipperReceiver }\r\nBroadcast completed: result=0\r\n"
+  },
+  {
+    "name": "Device still responsive to adb shell",
+    "ok": true,
+    "ms": 46,
+    "http": 0,
+    "body": "hello"
+  }
+]

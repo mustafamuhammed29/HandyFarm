@@ -68,6 +68,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setDeviceLeaseState: (physicalDeviceId: string, state: string, sessionId?: string) => ipcRenderer.invoke('set-device-lease-state', physicalDeviceId, state, sessionId),
   getExpertMode: () => ipcRenderer.invoke('get-expert-mode'),
   setExpertMode: (enabled: boolean) => ipcRenderer.invoke('set-expert-mode', enabled),
+
+  // Clipper Companion Control Panel
+  getClipperInfo: (deviceId: string) => ipcRenderer.invoke('get-clipper-info', deviceId),
+  installClipper: (deviceId: string) => ipcRenderer.invoke('install-clipper', deviceId),
 });
 
 

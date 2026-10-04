@@ -65,6 +65,7 @@ import {
   type BaselineVerificationResult
 } from './baseline.js';
 import { executeNetworkPreflight } from './network.js';
+import { sendTextToDevice } from './textInput.js';
 
 /**
  * Guard function to enforce exclusive device lease access on destructive actions.
@@ -1281,6 +1282,61 @@ ipcMain.handle('get-companion-identity', async (_event, deviceId: string) => {
   return await getCompanionIdentity(deviceId);
 });
 
+interface ClipperInfo {
+  installed: boolean;
+  version?: string;
+  firstInstallTime?: string;
+  lastUpdateTime?: string;
+  error?: string;
+}
+
+ipcMain.handle('get-clipper-info', async (_event, deviceId: string): Promise<ClipperInfo> => {
+  try {
+    const pmStream = await client.getDevice(deviceId).shell(`pm path ${CLIPPER_PACKAGE}`);
+    const pmOut = (await Adb.util.readAll(pmStream)).toString();
+    if (!pmOut.includes('package:')) {
+      return { installed: false };
+    }
+    const dStream = await client.getDevice(deviceId).shell(`dumpsys package ${CLIPPER_PACKAGE} | grep -E "versionName=|firstInstallTime=|lastUpdateTime="`);
+    const dOut = (await Adb.util.readAll(dStream)).toString();
+    const info: ClipperInfo = { installed: true };
+    for (const line of dOut.split('\n')) {
+      const v = line.match(/versionName=([^\s]+)/);
+      if (v) info.version = v[1];
+      const f = line.match(/firstInstallTime=([^\s]+)/);
+      if (f) info.firstInstallTime = f[1];
+      const u = line.match(/lastUpdateTime=([^\s]+)/);
+      if (u) info.lastUpdateTime = u[1];
+    }
+    return info;
+  } catch (err: any) {
+    return { installed: false, error: err?.message || String(err) };
+  }
+});
+
+ipcMain.handle('install-clipper', async (_event, deviceId: string): Promise<ClipperInfo> => {
+  const apkPath = getResourcePath('clipper.apk');
+  if (!fs.existsSync(apkPath)) {
+    return { installed: false, error: `clipper.apk not found at ${apkPath}` };
+  }
+  try {
+    // Uninstall first so we get a fresh baseline, then install.
+    // -k preserves user data but companion has none, so full uninstall is fine.
+    await execFileAsync('adb', ['-s', deviceId, 'uninstall', CLIPPER_PACKAGE]).catch(() => {});
+    await execFileAsync('adb', ['-s', deviceId, 'install', '-r', '-d', '-g', apkPath]);
+    await grantCompanionAppOps(deviceId);
+    await bringClipperToFocus(deviceId);
+    await execFileAsync('adb', ['-s', deviceId, 'shell', 'input', 'keyevent', '4']).catch(() => {});
+    // Re-query info for the caller
+    const dStream = await client.getDevice(deviceId).shell(`dumpsys package ${CLIPPER_PACKAGE} | grep -E "versionName="`);
+    const dOut = (await Adb.util.readAll(dStream)).toString();
+    const version = dOut.match(/versionName=([^\s]+)/)?.[1];
+    return { installed: true, version };
+  } catch (err: any) {
+    return { installed: false, error: err?.message || String(err) };
+  }
+});
+
 async function getForegroundApp(deviceId: string): Promise<{ success: boolean; packageName?: string; error?: string; permissionRequired?: boolean }> {
   try {
     await ensureClipperInstalled(deviceId);
@@ -1744,17 +1800,16 @@ ipcMain.handle('send-text', async (_event, deviceId, text, sessionId?: string) =
   if (!leaseGuard.allowed) {
     return { success: false, error: leaseGuard.error };
   }
-  try {
-    const b64 = Buffer.from(text || '', 'utf-8').toString('base64');
-    await execFileAsync('adb', [
-      '-s', deviceId, 'shell',
-      `RAW=$(echo ${b64} | base64 -d); input text "$RAW"`
-    ]);
-    logAction(deviceId, `Sent text: ${text}`);
-    return { success: true };
-  } catch (e: any) {
-    return { success: false, error: e.message };
-  }
+  return await sendTextToDevice({
+    deviceId,
+    text,
+    ensureClipperInstalled,
+    execShell: async (_devId, cmd) => {
+      await execFileAsync('adb', ['-s', deviceId, 'shell', cmd]);
+    },
+    logAction,
+    clipperReceiver: CLIPPER_RECEIVER
+  });
 });
 
 ipcMain.handle('push-file', async (_event, deviceId, localPath, remotePath, sessionId?: string) => {
