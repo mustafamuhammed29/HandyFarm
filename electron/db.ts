@@ -696,6 +696,15 @@ export class DeviceStore {
     return this.physicalMappings.get(physicalDeviceId);
   }
 
+  findPhysicalMappingByTransport(transportId: string): PhysicalDeviceMapping | undefined {
+    for (const mapping of this.physicalMappings.values()) {
+      if (mapping.currentTransportId === transportId || mapping.lastSeenTransportId === transportId || mapping.serials.includes(transportId)) {
+        return mapping;
+      }
+    }
+    return undefined;
+  }
+
   getAllPhysicalMappings(): PhysicalDeviceMapping[] {
     return Array.from(this.physicalMappings.values());
   }

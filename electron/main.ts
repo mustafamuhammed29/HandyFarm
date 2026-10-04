@@ -55,64 +55,16 @@ function broadcastDelta(deviceId: string, patch: Partial<DeviceData>, removed = 
   }
 }
 
+import { evaluateDeviceLeaseGuard } from './leaseGuard.js';
+import { validateDeviceConfigImport as validateConfigImport } from './configValidation.js';
+
 /**
  * Guard function to enforce exclusive device lease access on destructive actions.
  * Allows action if device is available or caller sessionId holds the active lease.
  * Blocks if device is leased by another session, cooling down, quarantined, or in maintenance.
  */
 export function checkDeviceLeaseGuard(deviceId: string, sessionId?: string): { allowed: boolean; error?: string } {
-  let physId = deviceId;
-  const dev = deviceStore.getDevice(deviceId);
-  if (dev) {
-    physId = dev.physicalDeviceId || `phys_${dev.serial || dev.id}`;
-  } else {
-    const mapping = deviceStore.getPhysicalMapping(deviceId);
-    if (mapping?.physicalDeviceId) {
-      physId = mapping.physicalDeviceId;
-    }
-  }
-  const lease = deviceStore.getLease(physId);
-
-  // If cooling_down, quarantined, or maintenance, reject immediately
-  if (lease.state === 'cooling_down') {
-    const remaining = lease.leaseExpiresAt ? Math.max(0, Math.ceil((lease.leaseExpiresAt - Date.now()) / 1000)) : 5;
-    return { allowed: false, error: `Device is cooling down (${remaining}s remaining). Exclusive actions are temporarily blocked.` };
-  }
-  if (lease.state === 'quarantined') {
-    return { allowed: false, error: 'Device is quarantined. Exclusive actions are blocked.' };
-  }
-  if (lease.state === 'maintenance') {
-    return { allowed: false, error: 'Device is under maintenance. Exclusive actions are blocked.' };
-  }
-
-  // If leased, verify caller sessionId matches lease holder
-  if (lease.state === 'leased') {
-    const now = Date.now();
-    if (lease.leaseExpiresAt && lease.leaseExpiresAt <= now) {
-      // Lease TTL expired without renewal -> auto-release
-      const { changedLeases, affectedDeviceIds } = deviceStore.sweepExpiredLeases();
-      if (changedLeases.length > 0) {
-        for (const id of affectedDeviceIds) {
-          const dev = deviceStore.getDevice(id);
-          if (dev) {
-            broadcastDelta(id, {
-              leaseState: dev.leaseState,
-              leasedBy: dev.leasedBy ?? (null as any),
-              leaseExpiresAt: dev.leaseExpiresAt ?? (null as any),
-              lastHeartbeatAt: dev.lastHeartbeatAt ?? (null as any)
-            });
-          }
-        }
-      }
-      return { allowed: true };
-    }
-    if (!sessionId || sessionId !== lease.leasedBy) {
-      const expiresStr = lease.leaseExpiresAt ? new Date(lease.leaseExpiresAt).toLocaleTimeString() : 'unknown';
-      return { allowed: false, error: `Device is leased by session '${lease.leasedBy}' until ${expiresStr}. Exclusive action rejected.` };
-    }
-  }
-
-  return { allowed: true };
+  return evaluateDeviceLeaseGuard(deviceStore, deviceId, sessionId, (id, patch) => broadcastDelta(id, patch));
 }
 
 // Periodic sweep for expired leases & cooldown periods (every 2 seconds)
@@ -1135,92 +1087,8 @@ export function validateDeviceConfigImport(rawJson: unknown): {
   error?: string;
   sanitized?: Record<string, Partial<DeviceData>>;
 } {
-  if (typeof rawJson !== 'object' || rawJson === null || Array.isArray(rawJson)) {
-    return { valid: false, error: 'Import rejected: Configuration root must be a JSON object mapping device IDs to configuration.' };
-  }
-
-  const sanitized: Record<string, Partial<DeviceData>> = {};
-  const entries = Object.entries(rawJson);
-
-  if (entries.length === 0) {
-    return { valid: false, error: 'Import rejected: Configuration file contains no devices.' };
-  }
-
   const existingDevices = new Set(deviceStore.getAllDevices(false).map(d => d.id));
-
-  for (const [id, patch] of entries) {
-    if (id === '__proto__' || id === 'constructor' || id === 'prototype') {
-      return { valid: false, error: `Import rejected: Prohibited property name '${id}'.` };
-    }
-
-    if (typeof id !== 'string' || id.trim().length === 0 || id.length > 128) {
-      return { valid: false, error: `Import rejected: Invalid device ID '${id}'.` };
-    }
-
-    if (!existingDevices.has(id)) {
-      return { valid: false, error: `Import rejected: Device '${id}' does not exist in the current device inventory.` };
-    }
-
-    if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
-      return { valid: false, error: `Import rejected: Config for device '${id}' must be an object.` };
-    }
-
-    const cleanPatch: Partial<DeviceData> = {};
-    const allowedFields = new Set(['customName', 'notes', 'tags', 'isBareBoard']);
-
-    for (const [key, value] of Object.entries(patch)) {
-      if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
-        return { valid: false, error: `Import rejected: Prohibited property name '${key}' in device '${id}'.` };
-      }
-
-      if (!allowedFields.has(key)) {
-        return {
-          valid: false,
-          error: `Import rejected: Unauthorized or unknown field '${key}' in device '${id}'. Only user configuration (customName, notes, tags, isBareBoard) may be imported.`
-        };
-      }
-
-      if (key === 'customName') {
-        if (value !== undefined && typeof value !== 'string') {
-          return { valid: false, error: `Import rejected: 'customName' for '${id}' must be a string.` };
-        }
-        if (typeof value === 'string' && value.length > 100) {
-          return { valid: false, error: `Import rejected: 'customName' for '${id}' exceeds 100 characters.` };
-        }
-        cleanPatch.customName = value;
-      } else if (key === 'notes') {
-        if (value !== undefined && typeof value !== 'string') {
-          return { valid: false, error: `Import rejected: 'notes' for '${id}' must be a string.` };
-        }
-        if (typeof value === 'string' && value.length > 2000) {
-          return { valid: false, error: `Import rejected: 'notes' for '${id}' exceeds 2000 characters.` };
-        }
-        cleanPatch.notes = value;
-      } else if (key === 'tags') {
-        if (!Array.isArray(value)) {
-          return { valid: false, error: `Import rejected: 'tags' for '${id}' must be an array of strings.` };
-        }
-        if (value.length > 30) {
-          return { valid: false, error: `Import rejected: 'tags' for '${id}' exceeds maximum of 30 tags.` };
-        }
-        for (const tag of value) {
-          if (typeof tag !== 'string' || tag.length > 50) {
-            return { valid: false, error: `Import rejected: Each tag for '${id}' must be a string <= 50 characters.` };
-          }
-        }
-        cleanPatch.tags = value;
-      } else if (key === 'isBareBoard') {
-        if (typeof value !== 'boolean') {
-          return { valid: false, error: `Import rejected: 'isBareBoard' for '${id}' must be a boolean.` };
-        }
-        cleanPatch.isBareBoard = value;
-      }
-    }
-
-    sanitized[id] = cleanPatch;
-  }
-
-  return { valid: true, sanitized };
+  return validateConfigImport(rawJson, existingDevices);
 }
 
 ipcMain.handle('import-config', async () => {

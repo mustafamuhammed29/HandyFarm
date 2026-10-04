@@ -1,4 +1,6 @@
-# Shop Device Control Panel
+# Shop Device Control Panel (HandyFarm)
+
+> **Legitimate-Use Notice**: All devices and accounts in this farm test applications developed and owned directly by our organization. No third-party platform account-farming, scraping, or terms-of-service circumvention is in scope or permitted. See [CONTEXT.md](file:///c:/Users/musta/Desktop/HandyFarm/CONTEXT.md) for detailed operational boundaries.
 
 ## Prerequisites
 1. **Node.js** must be installed on this computer.

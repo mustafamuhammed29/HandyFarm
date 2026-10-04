@@ -103,7 +103,7 @@ export async function startApiServer(options: ApiServerOptions): Promise<ApiServ
   } = options;
 
   const targetHost = '127.0.0.1'; // Strictly loopback, never 0.0.0.0
-  const defaultPort = options.port || Number(process.env.HANDYFARM_API_PORT) || 5055;
+  const defaultPort = options.port !== undefined ? options.port : (Number(process.env.HANDYFARM_API_PORT) || 5055);
 
   // 1. Resolve auth file path
   const authFilePath = process.env.HANDYFARM_AUTH_FILE || path.join(userDataDir, 'api-auth.json');
@@ -121,7 +121,7 @@ export async function startApiServer(options: ApiServerOptions): Promise<ApiServ
       const parsed: AuthFileData = JSON.parse(raw);
       if (parsed.token && typeof parsed.token === 'string' && parsed.token.length >= 32) {
         token = parsed.token;
-        if (parsed.port && Number.isInteger(parsed.port)) {
+        if (options.port === undefined && parsed.port && Number.isInteger(parsed.port)) {
           savedPort = parsed.port;
         }
       } else {
