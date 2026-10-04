@@ -170,6 +170,15 @@ declare global {
       evaluateHealthNow?: () => Promise<{ evaluated: number; transitions: number }>;
       manualQuarantine?: (deviceId: string, reason?: string) => Promise<{ success: boolean; error?: string; reason?: string }>;
       clearQuarantine?: (deviceId: string) => Promise<{ success: boolean; error?: string }>;
+
+      // Phase 5: regression + screenshot diff + crash aggregation
+      runRegression?: (spec: any) => Promise<any>;
+      setGoldenBaseline?: (payload: { package: string; scenario: string; deviceFingerprint: string; imageBase64: string }) =>
+        Promise<{ success: boolean; key?: string; error?: string }>;
+      diffAgainstBaseline?: (payload: { package: string; scenario: string; deviceFingerprint: string; deviceSerial: string; imageBase64: string; capturePath?: string }) =>
+        Promise<{ success?: boolean; error?: string; result?: any; clusterKey?: string }>;
+      getCrashClusters?: () => Promise<{ totalRecords: number; clusters: any[] }>;
+      getDiffs?: () => Promise<{ clusters: any[] }>;
     };
   }
 }

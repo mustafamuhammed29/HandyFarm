@@ -79,6 +79,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   evaluateHealthNow: () => ipcRenderer.invoke('evaluate-health-now'),
   manualQuarantine: (deviceId: string, reason?: string) => ipcRenderer.invoke('manual-quarantine', deviceId, reason),
   clearQuarantine: (deviceId: string) => ipcRenderer.invoke('clear-quarantine', deviceId),
+
+  // Phase 5: regression + screenshot diff + crash aggregation
+  runRegression: (spec: any) => ipcRenderer.invoke('run-regression', spec),
+  setGoldenBaseline: (payload: { package: string; scenario: string; deviceFingerprint: string; imageBase64: string }) =>
+    ipcRenderer.invoke('set-golden-baseline', payload),
+  diffAgainstBaseline: (payload: { package: string; scenario: string; deviceFingerprint: string; deviceSerial: string; imageBase64: string; capturePath?: string }) =>
+    ipcRenderer.invoke('diff-against-baseline', payload),
+  getCrashClusters: () => ipcRenderer.invoke('get-crash-clusters'),
+  getDiffs: () => ipcRenderer.invoke('get-diffs'),
 });
 
 

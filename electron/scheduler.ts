@@ -270,6 +270,19 @@ export class Scheduler {
     });
   }
 
+  /**
+   * Cancel every in-flight job and reject new submits. Used by tests on
+   * teardown and by `app.on('before-quit')` to avoid orphaned background
+   * work after process exit.
+   */
+  stop(): void {
+    // Snapshot to avoid mutation-during-iteration.
+    const queuedIds = this.queue.map(q => q.id);
+    for (const id of queuedIds) this.cancel(id, 'scheduler_stopped');
+    const runningIds = Array.from(this.running.keys());
+    for (const id of runningIds) this.cancel(id, 'scheduler_stopped');
+  }
+
   // ----- internal -----
 
   private isDrained(): boolean {

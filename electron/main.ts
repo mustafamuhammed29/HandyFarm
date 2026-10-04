@@ -53,6 +53,13 @@ const RECONNECT_SCHEDULER_BASE_CAP = 3;
 const ADAPTIVE_CAP_BUDGET_KBPS = 480_000; // USB 2.0 hi-speed nominal
 let reconnectScheduler: Scheduler | null = null;
 
+// Phase 5: regression + screenshot diff + crash aggregation state.
+let regressionScheduler: Scheduler | null = null;
+const goldenBaselines: Map<string, { package: string; scenario: string; deviceFingerprint: string; pHash: bigint; grayscale: Uint8Array; width: number; height: number; capturedAt: number }> = new Map();
+const crashRecords: CrashRecord[] = [];
+let crashLogcatTail: { stop: () => void } | null = null;
+const CRASH_RETENTION_MS = 24 * 60 * 60_000; // keep 24h of records in memory
+
 function broadcastDelta(deviceId: string, patch: Partial<DeviceData>, removed = false) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('devices-updated', {
@@ -346,6 +353,33 @@ async function startAdbTracker() {
     try {
       const existingDevices = await client.listDevices();
       console.log(`[Startup] Found ${existingDevices.length} already-connected device(s):`, existingDevices.map((d: any) => `${d.id}(${d.type})`).join(', '));
+
+      // Phase 5: kick off the long-running crash/ANR logcat tail on the first
+      // 'device'-type entry we see. We do NOT poll; the child process streams
+      // crash+events buffer lines into our `crashRecords` accumulator.
+      const firstOnline = existingDevices.find((d: any) => d.type === 'device');
+      if (firstOnline && !crashLogcatTail) {
+        const serial = firstOnline.id;
+        const physId = `phys_${serial}`;
+        console.log(`[Phase 5] starting crash logcat tail for ${physId}`);
+        try {
+          crashLogcatTail = startCrashLogcat(serial, physId, (rec) => {
+            crashRecords.push(rec);
+            // Trim retention window.
+            const cutoff = Date.now() - CRASH_RETENTION_MS;
+            while (crashRecords.length > 0 && crashRecords[0].observedAt < cutoff) {
+              crashRecords.shift();
+            }
+            // On an actual crash (not an ANR / non-fatal) trigger bugreport.
+            if (rec.source === 'logcat-am_crash') {
+              captureBugreportAsync(serial).catch(() => { /* best-effort */ });
+            }
+          });
+        } catch (err) {
+          console.warn('[Phase 5] failed to start crash logcat tail:', err);
+        }
+      }
+
       for (const device of existingDevices) {
         console.log(`[Startup] Processing pre-connected device: ${device.id} (${device.type})`);
         const dev = deviceStore.getDevice(device.id);
@@ -506,6 +540,15 @@ async function startAdbTracker() {
       globalConcurrencyCap: RECONNECT_SCHEDULER_BASE_CAP,
       rateLimit: { maxJobs: 8, windowMs: 15000 }, // ≤8 connect attempts per 15s sweep window
       defaultDelay: { minMs: 200, maxMs: 800 },
+    });
+
+    // Phase 5: regression orchestrator uses a separate Scheduler so a single
+    // hung run can't starve the auto-reconnect sweep. Concurrency cap matches
+    // the worker's MAX_CONCURRENT_WORKERS.
+    regressionScheduler = new Scheduler({
+      globalConcurrencyCap: 4,
+      rateLimit: { maxJobs: 8, windowMs: 60_000 },
+      defaultDelay: { minMs: 50, maxMs: 200 },
     });
     reconnectScheduler.onAudit((e) => {
       if (e.status === 'completed' || e.status === 'failed') {
@@ -2040,6 +2083,21 @@ import { Scheduler } from './scheduler.js';
 import { HealthMonitor } from './healthMonitor.js';
 import { getAdaptiveConcurrencyCap, estimateFleetBandwidthKbps } from './power.js';
 
+// Phase 5: regression orchestration + screenshot diff + crash aggregation.
+import { runRegressionWithLease } from './regression.js';
+import type { RegressionSpec } from './regression.js';
+import {
+  diffAgainstGolden,
+  imageToPHashBuffer,
+  clusterKey as diffClusterKey,
+} from './screencapDiff.js';
+import type { DiffResult } from './screencapDiff.js';
+import {
+  startCrashLogcat,
+  clusterCrashes,
+} from './crashAggregator.js';
+import type { CrashRecord } from './crashAggregator.js';
+
 ipcMain.handle('get-expert-mode', () => expertModeEnabled);
 ipcMain.handle('set-expert-mode', (_event, enabled: boolean) => {
   expertModeEnabled = Boolean(enabled);
@@ -2460,5 +2518,79 @@ ipcMain.handle('clear-quarantine', async (_event, deviceId: string) => {
   console.log(`[IPC] Manual quarantine clear: ${physId}`);
   return res;
 });
+
+// ----- Phase 5: regression orchestration + screenshot diff + crash aggregation -----
+
+ipcMain.handle('run-regression', async (_event, spec: RegressionSpec) => {
+  if (!regressionScheduler) return { error: 'regressionScheduler not initialized' };
+  console.log(`[Phase 5] run-regression: runner=${spec.runner} device=${spec.deviceId} runId=${spec.runId}`);
+  return runRegressionWithLease(deviceStore, regressionScheduler, spec);
+});
+
+ipcMain.handle('set-golden-baseline', async (_event, payload: { package: string; scenario: string; deviceFingerprint: string; imageBase64: string }) => {
+  const buf = Buffer.from(payload.imageBase64, 'base64');
+  const { grayscale8x8, fullGrayscale, width, height } = imageToPHashBuffer(buf);
+  const pHash = (() => {
+    // Use the 8x8 grayscale as the canonical pHash input.
+    let h = 0n;
+    let sum = 0;
+    for (let i = 0; i < grayscale8x8.length; i++) sum += grayscale8x8[i];
+    const mean = sum / grayscale8x8.length;
+    for (let i = 0; i < grayscale8x8.length; i++) {
+      if (grayscale8x8[i] >= mean) h |= (1n << BigInt(grayscale8x8.length - 1 - i));
+    }
+    return h;
+  })();
+  const key = `${payload.package}|${payload.scenario}|${payload.deviceFingerprint}`;
+  goldenBaselines.set(key, {
+    package: payload.package,
+    scenario: payload.scenario,
+    deviceFingerprint: payload.deviceFingerprint,
+    pHash,
+    grayscale: fullGrayscale,
+    width,
+    height,
+    capturedAt: Date.now(),
+  });
+  console.log(`[Phase 5] golden baseline set: ${key} (${buf.length} bytes)`);
+  return { success: true, key };
+});
+
+ipcMain.handle('diff-against-baseline', async (_event, payload: { package: string; scenario: string; deviceFingerprint: string; deviceSerial: string; imageBase64: string; capturePath?: string }) => {
+  const buf = Buffer.from(payload.imageBase64, 'base64');
+  const { grayscale8x8, fullGrayscale, width, height } = imageToPHashBuffer(buf);
+  let h = 0n;
+  let sum = 0;
+  for (let i = 0; i < grayscale8x8.length; i++) sum += grayscale8x8[i];
+  const mean = sum / grayscale8x8.length;
+  for (let i = 0; i < grayscale8x8.length; i++) {
+    if (grayscale8x8[i] >= mean) h |= (1n << BigInt(grayscale8x8.length - 1 - i));
+  }
+  const key = `${payload.package}|${payload.scenario}|${payload.deviceFingerprint}`;
+  const golden = goldenBaselines.get(key);
+  if (!golden) return { error: `no golden baseline for ${key}` };
+  const result: DiffResult = diffAgainstGolden(fullGrayscale, h, width, height, golden, payload.deviceSerial, payload.capturePath);
+  return { success: true, result, clusterKey: diffClusterKey(result) };
+});
+
+ipcMain.handle('get-crash-clusters', async () => {
+  const clusters = clusterCrashes(crashRecords);
+  return { totalRecords: crashRecords.length, clusters };
+});
+
+ipcMain.handle('get-diffs', async () => {
+  // No persistent per-call history; the IPC is here for parity with crashes.
+  return { clusters: [] };
+});
+
+async function captureBugreportAsync(adbSerial: string): Promise<void> {
+  const outDir = path.join(os.tmpdir(), 'handyfarm-bugreports');
+  try {
+    const out = await import('./crashAggregator.js').then(m => m.captureBugreport(adbSerial, outDir));
+    console.log(`[Phase 5] bugreport captured: ${out}`);
+  } catch (err) {
+    console.warn(`[Phase 5] bugreport failed for ${adbSerial}:`, err);
+  }
+}
 
 
