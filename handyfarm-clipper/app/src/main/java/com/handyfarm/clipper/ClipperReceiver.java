@@ -28,6 +28,7 @@ public class ClipperReceiver extends BroadcastReceiver {
     public static final String ACTION_VPN_CONNECT = "handyfarm.vpn.connect";
     public static final String ACTION_VPN_DISCONNECT = "handyfarm.vpn.disconnect";
     public static final String ACTION_VPN_STATUS = "handyfarm.vpn.status";
+    public static final String ACTION_EGRESS_GET = "handyfarm.egress.get";
 
     private static final int FLAG_RECEIVER_FROM_SHELL = 0x00400000;
 
@@ -427,6 +428,97 @@ public class ClipperReceiver extends BroadcastReceiver {
             return;
         }
 
+        // Phase 2: Observed egress detection over device's active route
+        if (ACTION_EGRESS_GET.equals(action)) {
+            JSONObject egress = new JSONObject();
+            String transport = "unknown";
+            boolean isCellular = false;
+            boolean isWifi = false;
+            boolean isVpn = false;
+
+            try {
+                android.net.ConnectivityManager cm = (android.net.ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm != null) {
+                    android.net.Network activeNet = cm.getActiveNetwork();
+                    if (activeNet != null) {
+                        android.net.NetworkCapabilities caps = cm.getNetworkCapabilities(activeNet);
+                        if (caps != null) {
+                            if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                                transport = "cellular";
+                                isCellular = true;
+                            } else if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) {
+                                transport = "wifi";
+                                isWifi = true;
+                            } else if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) {
+                                transport = "vpn";
+                                isVpn = true;
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to query ConnectivityManager: " + e.getMessage());
+            }
+
+            String carrier = "unknown";
+            try {
+                android.telephony.TelephonyManager tm = (android.telephony.TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+                if (tm != null) {
+                    carrier = tm.getNetworkOperatorName();
+                    if (carrier == null || carrier.isEmpty()) {
+                        carrier = tm.getSimOperatorName();
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to query TelephonyManager: " + e.getMessage());
+            }
+
+            // Perform synchronous HTTP egress resolution
+            android.os.StrictMode.ThreadPolicy oldPolicy = android.os.StrictMode.getThreadPolicy();
+            android.os.StrictMode.setThreadPolicy(new android.os.StrictMode.ThreadPolicy.Builder().permitAll().build());
+            try {
+                egress.put("transport", transport);
+                egress.put("isCellular", isCellular);
+                egress.put("isWifi", isWifi);
+                egress.put("isVpn", isVpn);
+                egress.put("carrier", carrier);
+                egress.put("observedAt", System.currentTimeMillis());
+
+                JSONObject ipInfo = fetchHttpJson("https://ipinfo.io/json");
+                if (ipInfo != null && ipInfo.has("ip")) {
+                    egress.put("publicIp", ipInfo.optString("ip", ""));
+                    egress.put("asn", ipInfo.optString("org", "unknown"));
+                    JSONObject geo = new JSONObject();
+                    geo.put("country", ipInfo.optString("country", ""));
+                    geo.put("city", ipInfo.optString("city", ""));
+                    geo.put("region", ipInfo.optString("region", ""));
+                    geo.put("loc", ipInfo.optString("loc", ""));
+                    egress.put("geo", geo);
+                } else {
+                    JSONObject ipify = fetchHttpJson("https://api.ipify.org?format=json");
+                    if (ipify != null && ipify.has("ip")) {
+                        egress.put("publicIp", ipify.optString("ip", ""));
+                        egress.put("asn", "unknown");
+                        egress.put("geo", new JSONObject());
+                    } else {
+                        egress.put("error", "EGRESS_RESOLUTION_FAILED");
+                    }
+                }
+                setResultCode(Activity.RESULT_OK);
+                setResultData(egress.toString());
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to resolve observed egress", e);
+                try {
+                    egress.put("error", e.getMessage());
+                } catch (Exception ignored) {}
+                setResultCode(Activity.RESULT_OK);
+                setResultData(egress.toString());
+            } finally {
+                android.os.StrictMode.setThreadPolicy(oldPolicy);
+            }
+            return;
+        }
+
         ClipboardManager cm = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
         if (cm == null) {
             setResultCode(Activity.RESULT_CANCELED);
@@ -479,5 +571,35 @@ public class ClipperReceiver extends BroadcastReceiver {
                 setResultData("");
             }
         }
+    }
+
+    private JSONObject fetchHttpJson(String urlStr) {
+        java.net.HttpURLConnection conn = null;
+        try {
+            java.net.URL url = new java.net.URL(urlStr);
+            conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("User-Agent", "curl/7.88.1 HandyFarm/2.0");
+            conn.setRequestProperty("Accept", "application/json");
+            conn.setConnectTimeout(4000);
+            conn.setReadTimeout(4000);
+            int code = conn.getResponseCode();
+            if (code == 200) {
+                java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(conn.getInputStream()));
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    sb.append(line);
+                }
+                reader.close();
+                return new JSONObject(sb.toString());
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (conn != null) {
+                try { conn.disconnect(); } catch (Exception ignored) {}
+            }
+        }
+        return null;
     }
 }

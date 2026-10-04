@@ -64,6 +64,7 @@
                 <action android:name="handyfarm.vpn.connect" />
                 <action android:name="handyfarm.vpn.disconnect" />
                 <action android:name="handyfarm.vpn.status" />
+                <action android:name="handyfarm.egress.get" />
             </intent-filter>
         </receiver>
 

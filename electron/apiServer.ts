@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import adbkit from '@devicefarmer/adbkit';
 import type { DeviceStore, DeviceData } from './db.js';
+import { evaluateDataBudget } from './network.js';
 
 const Adb = (adbkit as any).Adb || (adbkit as any).default?.Adb || (adbkit as any).default || adbkit;
 
@@ -21,6 +22,7 @@ export interface ApiServerOptions {
   captureBaseline?: (deviceId: string) => Promise<{ success: boolean; manifest?: any; error?: string }>;
   verifyBaseline?: (deviceId: string) => Promise<{ success: boolean; result?: any; error?: string }>;
   resetToBaseline?: (deviceId: string, sessionId?: string) => Promise<{ success: boolean; actions?: string[]; verification?: any; error?: string }>;
+  runNetworkPreflight?: (deviceId: string, options?: { expectedCarrier?: string; runId?: string; requiredBytes?: number }) => Promise<any>;
 }
 
 export interface ApiServerHandle {
@@ -528,6 +530,123 @@ export async function startApiServer(options: ApiServerOptions): Promise<ApiServ
             message: 'Artifacts retrieval endpoint placeholder (Phase 7)'
           }
         });
+      }
+
+      // --- Phase 2: Network & SIM Inventory Endpoints ---
+
+      // 13. GET /devices/:id/sim (Get assigned SIM for device)
+      const deviceSimMatch = pathname.match(/^\/devices\/([^/]+)\/sim\/?$/);
+      if (deviceSimMatch && method === 'GET') {
+        const rawId = decodeURIComponent(deviceSimMatch[1]);
+        const sim = deviceStore.getSimForDevice(rawId);
+        if (!sim) {
+          return sendJson(res, 404, { success: false, error: `No SIM card assigned to device '${rawId}'` });
+        }
+        return sendJson(res, 200, { success: true, sim, budget: evaluateDataBudget(sim) });
+      }
+
+      // 14. POST /devices/:id/sim/assign (Assign a SIM to device)
+      const deviceSimAssignMatch = pathname.match(/^\/devices\/([^/]+)\/sim\/assign\/?$/);
+      if (deviceSimAssignMatch && method === 'POST') {
+        const rawId = decodeURIComponent(deviceSimAssignMatch[1]);
+        const body = await parseJsonBody(req);
+        if (!body.simId) {
+          return sendJson(res, 400, { success: false, error: 'Missing required field: simId' });
+        }
+
+        try {
+          const sim = deviceStore.assignSim(body.simId, rawId, body.slot);
+          return sendJson(res, 200, { success: true, deviceId: rawId, sim });
+        } catch (err: any) {
+          return sendJson(res, 400, { success: false, error: err?.message || 'Failed to assign SIM' });
+        }
+      }
+
+      // 15. POST /devices/:id/sim/unassign (Unassign SIM from device)
+      const deviceSimUnassignMatch = pathname.match(/^\/devices\/([^/]+)\/sim\/unassign\/?$/);
+      if (deviceSimUnassignMatch && method === 'POST') {
+        const rawId = decodeURIComponent(deviceSimUnassignMatch[1]);
+        deviceStore.unassignSim(rawId);
+        return sendJson(res, 200, { success: true, deviceId: rawId, message: 'SIM unassigned' });
+      }
+
+      // 16. GET /devices/:id/egress/history (Get observed egress history records)
+      const egressHistoryMatch = pathname.match(/^\/devices\/([^/]+)\/egress\/history\/?$/);
+      if (egressHistoryMatch && method === 'GET') {
+        const rawId = decodeURIComponent(egressHistoryMatch[1]);
+        const limitParam = parsedUrl.query?.limit;
+        const limit = limitParam ? Number(limitParam) : 50;
+        const egressHistory = deviceStore.getEgressHistory(rawId, limit);
+        return sendJson(res, 200, { success: true, deviceId: rawId, egressHistory, count: egressHistory.length });
+      }
+
+      // 17. POST /devices/:id/preflight/network (Run network preflight assertions)
+      const preflightMatch = pathname.match(/^\/devices\/([^/]+)\/preflight\/network\/?$/);
+      if (preflightMatch && method === 'POST') {
+        const rawId = decodeURIComponent(preflightMatch[1]);
+        const body = await parseJsonBody(req);
+
+        if (!options.runNetworkPreflight) {
+          return sendJson(res, 501, { success: false, error: 'Network preflight is not configured on this server' });
+        }
+
+        const result = await options.runNetworkPreflight(rawId, body);
+        return sendJson(res, result.passed ? 200 : 412, result);
+      }
+
+      // 18. GET /sims (List all SIM cards + fleet data budget)
+      if (pathname === '/sims' && method === 'GET') {
+        const sims = deviceStore.getAllSims();
+        const fleetBudget = deviceStore.getFleetDataBudget();
+        return sendJson(res, 200, { success: true, sims, fleetBudget });
+      }
+
+      // 19. POST /sims (Create or update SIM record in inventory)
+      if (pathname === '/sims' && method === 'POST') {
+        const body = await parseJsonBody(req);
+        if (!body.iccid || !body.carrier || !body.apn || !body.plan || !body.dataCapBytes || !body.renewalDate) {
+          return sendJson(res, 400, {
+            success: false,
+            error: 'Missing required SIM fields: iccid, carrier, apn, plan, dataCapBytes, renewalDate'
+          });
+        }
+
+        try {
+          const sim = deviceStore.saveSim(body);
+          return sendJson(res, 200, { success: true, sim });
+        } catch (err: any) {
+          return sendJson(res, 400, { success: false, error: err?.message || 'Failed to save SIM' });
+        }
+      }
+
+      // 20. GET /sims/:id (Get single SIM record by ID)
+      const simGetMatch = pathname.match(/^\/sims\/([^/]+)\/?$/);
+      if (simGetMatch && method === 'GET') {
+        const simId = decodeURIComponent(simGetMatch[1]);
+        const sim = deviceStore.getSim(simId);
+        if (!sim) {
+          return sendJson(res, 404, { success: false, error: `SIM '${simId}' not found in inventory` });
+        }
+        return sendJson(res, 200, { success: true, sim, budget: evaluateDataBudget(sim) });
+      }
+
+      // 21. POST /sims/:id/consume (Record data usage with 80% warning and 100% hard circuit breaker)
+      const simConsumeMatch = pathname.match(/^\/sims\/([^/]+)\/consume\/?$/);
+      if (simConsumeMatch && method === 'POST') {
+        const simId = decodeURIComponent(simConsumeMatch[1]);
+        const body = await parseJsonBody(req);
+        const bytesUsed = Number(body.bytesUsed);
+        if (!bytesUsed || isNaN(bytesUsed) || bytesUsed <= 0) {
+          return sendJson(res, 400, { success: false, error: 'bytesUsed must be a positive number' });
+        }
+
+        try {
+          const sim = deviceStore.recordSimDataConsumption(simId, bytesUsed);
+          const budget = evaluateDataBudget(sim);
+          return sendJson(res, 200, { success: true, sim, budget });
+        } catch (err: any) {
+          return sendJson(res, 400, { success: false, error: err?.message || 'Failed to record consumption' });
+        }
       }
 
       // Fallback 404 Not Found

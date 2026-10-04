@@ -64,6 +64,7 @@ import {
   type BaselineManifest,
   type BaselineVerificationResult
 } from './baseline.js';
+import { executeNetworkPreflight } from './network.js';
 
 /**
  * Guard function to enforce exclusive device lease access on destructive actions.
@@ -248,7 +249,20 @@ app.whenReady().then(() => {
     userDataDir: app.getPath('userData'),
     captureBaseline,
     verifyBaseline,
-    resetToBaseline: resetDeviceToBaseline
+    resetToBaseline: resetDeviceToBaseline,
+    runNetworkPreflight: async (deviceId, opts = {}) => {
+      const dev = deviceStore.getDevice(deviceId);
+      const physId = dev?.physicalDeviceId || `phys_${dev?.serial || deviceId}`;
+      return executeNetworkPreflight(
+        { deviceId, ...opts },
+        {
+          getSimForDevice: (id) => deviceStore.getSimForDevice(id),
+          recordEgress: (egress) => deviceStore.recordObservedEgress(egress),
+          execAdb: (args) => execFileAsync('adb', args),
+          physicalDeviceId: physId
+        }
+      );
+    }
   }).then((handle) => {
     apiServerHandle = handle;
   }).catch((err) => {

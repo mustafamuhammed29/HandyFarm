@@ -40,6 +40,8 @@ export interface DeviceData {
   driftWarnings?: string[];
   lastVerifiedAt?: number;
   lastBaselineAt?: number;
+  simId?: string;
+  assignedSim?: SimRecord;
 }
 
 import type { PhysicalDeviceMapping, DeviceHardwareProps } from './identity.js';
@@ -49,6 +51,11 @@ export { generatePhysicalDeviceId };
 
 import type { BaselineManifest, BaselineVerificationResult } from './baseline.js';
 export type { BaselineManifest, BaselineVerificationResult };
+
+import type { SimRecord, ObservedEgress, DataBudgetStatus, FleetBudgetSummary } from './network.js';
+import { calculateFleetDataBudget, evaluateDataBudget, sanitizeSimRecord } from './network.js';
+export type { SimRecord, ObservedEgress, DataBudgetStatus, FleetBudgetSummary };
+export { calculateFleetDataBudget, evaluateDataBudget, sanitizeSimRecord };
 
 // -------------------------------------------------------------
 // In-Memory Bounded LRU Thumbnail Cache
@@ -140,6 +147,21 @@ export class DeviceStore {
   private stmtGetAllBaselines!: Database.Statement;
   private stmtDeleteBaseline!: Database.Statement;
 
+  private sims = new Map<string, SimRecord>();
+  private stmtUpsertSim!: Database.Statement;
+  private stmtGetSim!: Database.Statement;
+  private stmtGetSimByDevice!: Database.Statement;
+  private stmtGetAllSims!: Database.Statement;
+  private stmtDeleteSim!: Database.Statement;
+  private stmtAssignSimToDevice!: Database.Statement;
+  private stmtClearSimDeviceAssignment!: Database.Statement;
+  private stmtClearDeviceSimId!: Database.Statement;
+  private stmtUpdateDeviceSimId!: Database.Statement;
+  private stmtUpdateSimUsage!: Database.Statement;
+  private stmtInsertEgress!: Database.Statement;
+  private stmtGetEgressHistory!: Database.Statement;
+  private stmtGetLatestEgress!: Database.Statement;
+
   constructor(dbPath: string, jsonBackupPath?: string) {
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) {
@@ -228,6 +250,43 @@ export class DeviceStore {
         updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_baselines_device_id ON device_baselines(device_id);
+
+      CREATE TABLE IF NOT EXISTS sim_inventory (
+        id TEXT PRIMARY KEY,
+        slot INTEGER NOT NULL DEFAULT 1,
+        iccid TEXT NOT NULL UNIQUE,
+        carrier TEXT NOT NULL,
+        apn TEXT NOT NULL,
+        plan TEXT NOT NULL,
+        data_cap_bytes INTEGER NOT NULL,
+        data_used_bytes INTEGER NOT NULL DEFAULT 0,
+        renewal_date TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'unassigned',
+        imsi_hashed TEXT NOT NULL,
+        msisdn_redacted TEXT NOT NULL,
+        assigned_device_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_sim_assigned_device ON sim_inventory(assigned_device_id);
+      CREATE INDEX IF NOT EXISTS idx_sim_iccid ON sim_inventory(iccid);
+      CREATE INDEX IF NOT EXISTS idx_sim_status ON sim_inventory(status);
+
+      CREATE TABLE IF NOT EXISTS egress_history (
+        id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        physical_device_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        public_ip TEXT NOT NULL,
+        asn TEXT NOT NULL,
+        carrier TEXT NOT NULL,
+        geo_json TEXT NOT NULL,
+        transport TEXT NOT NULL,
+        observed_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_egress_device_time ON egress_history(device_id, observed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_egress_phys_time ON egress_history(physical_device_id, observed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_egress_run_id ON egress_history(run_id);
     `);
 
     // Ensure physical_device_id column exists if table was created in an earlier migration
@@ -264,6 +323,10 @@ export class DeviceStore {
     if (!cols.some(c => c.name === 'last_baseline_at')) {
       this.db.exec('ALTER TABLE devices ADD COLUMN last_baseline_at INTEGER;');
     }
+    if (!cols.some(c => c.name === 'sim_id')) {
+      this.db.exec('ALTER TABLE devices ADD COLUMN sim_id TEXT;');
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_devices_sim_id ON devices(sim_id);');
+    }
     this.db.exec("UPDATE devices SET lease_state = 'available' WHERE lease_state IS NULL OR lease_state = '';");
     this.db.exec("UPDATE devices SET baseline_status = 'unbaselined' WHERE baseline_status IS NULL OR baseline_status = '';");
   }
@@ -274,13 +337,13 @@ export class DeviceStore {
         id, physical_device_id, serial, status, model, manufacturer, name, custom_name, notes,
         is_bare_board, tags, connected_at, last_known_ip, battery_level, battery_charging,
         lease_state, leased_by, lease_expires_at, last_heartbeat_at,
-        baseline_status, drift_count, drift_warnings, last_verified_at, last_baseline_at,
+        baseline_status, drift_count, drift_warnings, last_verified_at, last_baseline_at, sim_id,
         updated_at
       ) VALUES (
         @id, @physicalDeviceId, @serial, @status, @model, @manufacturer, @name, @customName, @notes,
         @isBareBoard, @tags, @connectedAt, @lastKnownIp, @batteryLevel, @batteryCharging,
         @leaseState, @leasedBy, @leaseExpiresAt, @lastHeartbeatAt,
-        @baselineStatus, @driftCount, @driftWarnings, @lastVerifiedAt, @lastBaselineAt,
+        @baselineStatus, @driftCount, @driftWarnings, @lastVerifiedAt, @lastBaselineAt, @simId,
         @updatedAt
       )
       ON CONFLICT(id) DO UPDATE SET
@@ -307,6 +370,7 @@ export class DeviceStore {
         drift_warnings = COALESCE(excluded.drift_warnings, devices.drift_warnings),
         last_verified_at = COALESCE(excluded.last_verified_at, devices.last_verified_at),
         last_baseline_at = COALESCE(excluded.last_baseline_at, devices.last_baseline_at),
+        sim_id = COALESCE(excluded.sim_id, devices.sim_id),
         updated_at = excluded.updated_at
     `);
 
@@ -377,6 +441,53 @@ export class DeviceStore {
     `);
     this.stmtGetAllBaselines = this.db.prepare(`SELECT * FROM device_baselines`);
     this.stmtDeleteBaseline = this.db.prepare(`DELETE FROM device_baselines WHERE physical_device_id = ?`);
+
+    this.stmtUpsertSim = this.db.prepare(`
+      INSERT INTO sim_inventory (
+        id, slot, iccid, carrier, apn, plan, data_cap_bytes, data_used_bytes, renewal_date,
+        status, imsi_hashed, msisdn_redacted, assigned_device_id, created_at, updated_at
+      ) VALUES (
+        @id, @slot, @iccid, @carrier, @apn, @plan, @dataCapBytes, @dataUsedBytes, @renewalDate,
+        @status, @imsiHashed, @msisdnRedacted, @assignedDeviceId, @createdAt, @updatedAt
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        slot = excluded.slot,
+        iccid = excluded.iccid,
+        carrier = excluded.carrier,
+        apn = excluded.apn,
+        plan = excluded.plan,
+        data_cap_bytes = excluded.data_cap_bytes,
+        data_used_bytes = excluded.data_used_bytes,
+        renewal_date = excluded.renewal_date,
+        status = excluded.status,
+        imsi_hashed = excluded.imsi_hashed,
+        msisdn_redacted = excluded.msisdn_redacted,
+        assigned_device_id = excluded.assigned_device_id,
+        updated_at = excluded.updated_at
+    `);
+    this.stmtGetSim = this.db.prepare(`SELECT * FROM sim_inventory WHERE id = ?`);
+    this.stmtGetSimByDevice = this.db.prepare(`SELECT * FROM sim_inventory WHERE assigned_device_id = ?`);
+    this.stmtGetAllSims = this.db.prepare(`SELECT * FROM sim_inventory ORDER BY id ASC`);
+    this.stmtDeleteSim = this.db.prepare(`DELETE FROM sim_inventory WHERE id = ?`);
+    this.stmtAssignSimToDevice = this.db.prepare(`UPDATE sim_inventory SET assigned_device_id = ?, status = 'active', updated_at = ? WHERE id = ?`);
+    this.stmtClearSimDeviceAssignment = this.db.prepare(`UPDATE sim_inventory SET assigned_device_id = NULL, status = 'unassigned', updated_at = ? WHERE assigned_device_id = ?`);
+    this.stmtClearDeviceSimId = this.db.prepare(`UPDATE devices SET sim_id = NULL WHERE id = ? OR physical_device_id = ?`);
+    this.stmtUpdateDeviceSimId = this.db.prepare(`UPDATE devices SET sim_id = ? WHERE id = ?`);
+    this.stmtUpdateSimUsage = this.db.prepare(`UPDATE sim_inventory SET data_used_bytes = data_used_bytes + ?, updated_at = ? WHERE id = ?`);
+
+    this.stmtInsertEgress = this.db.prepare(`
+      INSERT INTO egress_history (
+        id, device_id, physical_device_id, run_id, public_ip, asn, carrier, geo_json, transport, observed_at
+      ) VALUES (
+        @id, @deviceId, @physicalDeviceId, @runId, @publicIp, @asn, @carrier, @geoJson, @transport, @observedAt
+      )
+    `);
+    this.stmtGetEgressHistory = this.db.prepare(`
+      SELECT * FROM egress_history WHERE device_id = ? OR physical_device_id = ? ORDER BY observed_at DESC LIMIT ?
+    `);
+    this.stmtGetLatestEgress = this.db.prepare(`
+      SELECT * FROM egress_history WHERE device_id = ? OR physical_device_id = ? ORDER BY observed_at DESC LIMIT 1
+    `);
   }
 
   private migrateFromJsonIfEmpty(jsonPath: string) {
@@ -465,7 +576,34 @@ export class DeviceStore {
       console.warn('[DeviceStore] Failed to load leases from SQLite:', err);
     }
 
-    // 2. Load devices from SQLite
+    // 2. Load SIM inventory from SQLite
+    this.sims.clear();
+    try {
+      const simRows = this.stmtGetAllSims.all() as any[];
+      for (const sr of simRows) {
+        this.sims.set(sr.id, {
+          id: sr.id,
+          slot: sr.slot,
+          iccid: sr.iccid,
+          carrier: sr.carrier,
+          apn: sr.apn,
+          plan: sr.plan,
+          dataCapBytes: sr.data_cap_bytes,
+          dataUsedBytes: sr.data_used_bytes,
+          renewalDate: sr.renewal_date,
+          status: sr.status,
+          imsiHashed: sr.imsi_hashed,
+          msisdnRedacted: sr.msisdn_redacted,
+          assignedDeviceId: sr.assigned_device_id || null,
+          createdAt: sr.created_at,
+          updatedAt: sr.updated_at
+        });
+      }
+    } catch (err) {
+      console.warn('[DeviceStore] Failed to load SIM inventory from SQLite:', err);
+    }
+
+    // 3. Load devices from SQLite
     this.inMemoryDevices.clear();
     const rows = this.stmtSelectAllDevices.all() as any[];
     for (const r of rows) {
@@ -521,6 +659,8 @@ export class DeviceStore {
         driftWarnings,
         lastVerifiedAt: r.last_verified_at || undefined,
         lastBaselineAt: r.last_baseline_at || undefined,
+        simId: r.sim_id || undefined,
+        assignedSim: r.sim_id ? this.sims.get(r.sim_id) : undefined,
         history
       };
 
@@ -859,6 +999,7 @@ export class DeviceStore {
             driftWarnings: (patch.driftWarnings || current.driftWarnings) ? JSON.stringify(patch.driftWarnings || current.driftWarnings) : null,
             lastVerifiedAt: patch.lastVerifiedAt ?? current.lastVerifiedAt ?? null,
             lastBaselineAt: patch.lastBaselineAt ?? current.lastBaselineAt ?? null,
+            simId: patch.simId !== undefined ? (patch.simId || null) : (current.simId ?? null),
             updatedAt: now
           });
         }
@@ -1175,6 +1316,253 @@ export class DeviceStore {
       const pending = this.pendingWrites.get(deviceId) || {};
       this.pendingWrites.set(deviceId, { ...pending, ...dev });
       this.scheduleDebouncedFlush();
+    }
+  }
+
+  // --- Phase 2: SIM Inventory & Egress Tracking ---
+
+  saveSim(sim: Partial<SimRecord> & { iccid: string; carrier: string; apn: string; plan: string; dataCapBytes: number; renewalDate: string }): SimRecord {
+    const clean = sanitizeSimRecord(sim);
+    const now = Date.now();
+    this.stmtUpsertSim.run({
+      id: clean.id,
+      slot: clean.slot,
+      iccid: clean.iccid,
+      carrier: clean.carrier,
+      apn: clean.apn,
+      plan: clean.plan,
+      dataCapBytes: clean.dataCapBytes,
+      dataUsedBytes: clean.dataUsedBytes,
+      renewalDate: clean.renewalDate,
+      status: clean.status,
+      imsiHashed: clean.imsiHashed,
+      msisdnRedacted: clean.msisdnRedacted,
+      assignedDeviceId: clean.assignedDeviceId || null,
+      createdAt: clean.createdAt,
+      updatedAt: now
+    });
+    this.sims.set(clean.id, clean);
+
+    if (clean.assignedDeviceId) {
+      const dev = this.inMemoryDevices.get(clean.assignedDeviceId);
+      if (dev) {
+        dev.simId = clean.id;
+        dev.assignedSim = clean;
+        this.pendingWrites.set(clean.assignedDeviceId, { ...dev, simId: clean.id });
+        this.scheduleDebouncedFlush();
+      }
+    }
+    return clean;
+  }
+
+  getSim(simId: string): SimRecord | undefined {
+    const cached = this.sims.get(simId);
+    if (cached) return cached;
+    try {
+      const sr = this.stmtGetSim.get(simId) as any;
+      if (sr) {
+        const record: SimRecord = {
+          id: sr.id,
+          slot: sr.slot,
+          iccid: sr.iccid,
+          carrier: sr.carrier,
+          apn: sr.apn,
+          plan: sr.plan,
+          dataCapBytes: sr.data_cap_bytes,
+          dataUsedBytes: sr.data_used_bytes,
+          renewalDate: sr.renewal_date,
+          status: sr.status,
+          imsiHashed: sr.imsi_hashed,
+          msisdnRedacted: sr.msisdn_redacted,
+          assignedDeviceId: sr.assigned_device_id || null,
+          createdAt: sr.created_at,
+          updatedAt: sr.updated_at
+        };
+        this.sims.set(record.id, record);
+        return record;
+      }
+    } catch {}
+    return undefined;
+  }
+
+  getSimForDevice(deviceIdOrPhysId: string): SimRecord | undefined {
+    const dev = this.inMemoryDevices.get(deviceIdOrPhysId);
+    if (dev?.simId) {
+      return this.getSim(dev.simId);
+    }
+    for (const sim of this.sims.values()) {
+      if (sim.assignedDeviceId === deviceIdOrPhysId || (dev?.physicalDeviceId && sim.assignedDeviceId === dev.physicalDeviceId)) {
+        return sim;
+      }
+    }
+    try {
+      const sr = this.stmtGetSimByDevice.get(deviceIdOrPhysId) as any;
+      if (sr) return this.getSim(sr.id);
+    } catch {}
+    return undefined;
+  }
+
+  getAllSims(): SimRecord[] {
+    return Array.from(this.sims.values());
+  }
+
+  deleteSim(simId: string): boolean {
+    const sim = this.sims.get(simId);
+    if (sim?.assignedDeviceId) {
+      const dev = this.inMemoryDevices.get(sim.assignedDeviceId);
+      if (dev && dev.simId === simId) {
+        dev.simId = undefined;
+        dev.assignedSim = undefined;
+        this.pendingWrites.set(sim.assignedDeviceId, { ...dev, simId: undefined });
+        this.scheduleDebouncedFlush();
+      }
+    }
+    this.sims.delete(simId);
+    const res = this.stmtDeleteSim.run(simId);
+    return res.changes > 0;
+  }
+
+  assignSim(simId: string, deviceId: string, slot?: number): SimRecord {
+    const sim = this.sims.get(simId);
+    if (!sim) {
+      throw new Error(`SIM '${simId}' not found in inventory.`);
+    }
+
+    const now = Date.now();
+    // Clear any previous SIM assignment on this device
+    this.stmtClearSimDeviceAssignment.run(now, deviceId);
+    for (const s of this.sims.values()) {
+      if (s.assignedDeviceId === deviceId) {
+        s.assignedDeviceId = null;
+        s.status = 'unassigned';
+        s.updatedAt = now;
+      }
+    }
+
+    sim.assignedDeviceId = deviceId;
+    sim.status = 'active';
+    if (slot !== undefined) sim.slot = slot;
+    sim.updatedAt = now;
+
+    this.stmtAssignSimToDevice.run(deviceId, now, simId);
+    this.stmtUpdateDeviceSimId.run(simId, deviceId);
+
+    const dev = this.inMemoryDevices.get(deviceId);
+    if (dev) {
+      dev.simId = simId;
+      dev.assignedSim = sim;
+      this.pendingWrites.set(deviceId, { ...dev, simId });
+      this.scheduleDebouncedFlush();
+    }
+
+    return sim;
+  }
+
+  unassignSim(deviceId: string): void {
+    const now = Date.now();
+    this.stmtClearSimDeviceAssignment.run(now, deviceId);
+    this.stmtClearDeviceSimId.run(deviceId, deviceId);
+
+    for (const s of this.sims.values()) {
+      if (s.assignedDeviceId === deviceId) {
+        s.assignedDeviceId = null;
+        s.status = 'unassigned';
+        s.updatedAt = now;
+      }
+    }
+
+    const dev = this.inMemoryDevices.get(deviceId);
+    if (dev) {
+      dev.simId = undefined;
+      dev.assignedSim = undefined;
+      this.pendingWrites.set(deviceId, { ...dev, simId: undefined });
+      this.scheduleDebouncedFlush();
+    }
+  }
+
+  recordSimDataConsumption(simId: string, bytesUsed: number): SimRecord {
+    const sim = this.sims.get(simId);
+    if (!sim) {
+      throw new Error(`SIM '${simId}' not found in inventory.`);
+    }
+
+    const now = Date.now();
+    sim.dataUsedBytes += bytesUsed;
+    sim.updatedAt = now;
+    if (sim.dataUsedBytes >= sim.dataCapBytes) {
+      sim.status = 'depleted';
+    }
+
+    this.stmtUpdateSimUsage.run(bytesUsed, now, simId);
+    return sim;
+  }
+
+  getFleetDataBudget(): FleetBudgetSummary {
+    return calculateFleetDataBudget(Array.from(this.sims.values()));
+  }
+
+  recordObservedEgress(egress: ObservedEgress): void {
+    this.stmtInsertEgress.run({
+      id: egress.id,
+      deviceId: egress.deviceId,
+      physicalDeviceId: egress.physicalDeviceId,
+      runId: egress.runId,
+      publicIp: egress.publicIp,
+      asn: egress.asn,
+      carrier: egress.carrier,
+      geoJson: JSON.stringify(egress.geo || {}),
+      transport: egress.transport,
+      observedAt: egress.observedAt
+    });
+  }
+
+  getEgressHistory(deviceId: string, limit = 50): ObservedEgress[] {
+    let physId = deviceId;
+    const dev = this.inMemoryDevices.get(deviceId);
+    if (dev?.physicalDeviceId) physId = dev.physicalDeviceId;
+
+    try {
+      const rows = this.stmtGetEgressHistory.all(deviceId, physId, limit) as any[];
+      return rows.map(r => ({
+        id: r.id,
+        deviceId: r.device_id,
+        physicalDeviceId: r.physical_device_id,
+        runId: r.run_id,
+        publicIp: r.public_ip,
+        asn: r.asn,
+        carrier: r.carrier,
+        geo: JSON.parse(r.geo_json || '{}'),
+        transport: r.transport,
+        observedAt: r.observed_at
+      }));
+    } catch (err) {
+      console.warn(`[DeviceStore] Failed to load egress history for ${deviceId}:`, err);
+      return [];
+    }
+  }
+
+  getLatestEgress(deviceId: string): ObservedEgress | undefined {
+    let physId = deviceId;
+    const dev = this.inMemoryDevices.get(deviceId);
+    if (dev?.physicalDeviceId) physId = dev.physicalDeviceId;
+
+    try {
+      const row = this.stmtGetLatestEgress.get(deviceId, physId) as any;
+      if (!row) return undefined;
+      return {
+        id: row.id,
+        deviceId: row.device_id,
+        physicalDeviceId: row.physical_device_id,
+        runId: row.run_id,
+        publicIp: row.public_ip,
+        asn: row.asn,
+        carrier: row.carrier,
+        geo: JSON.parse(row.geo_json || '{}'),
+        transport: row.transport,
+        observedAt: row.observed_at
+      };
+    } catch {
+      return undefined;
     }
   }
 
