@@ -37,8 +37,10 @@ const workers: Map<string, ChildProcess> = new Map();
 const workerGenerations: Map<string, number> = new Map();
 
 import { DeviceStore, thumbnailCache, downscaleThumbnail, type DeviceData } from './db.js';
+import { startApiServer, type ApiServerHandle } from './apiServer.js';
 export { DeviceStore, thumbnailCache, downscaleThumbnail };
 
+let apiServerHandle: ApiServerHandle | null = null;
 const sqliteDbPath = path.join(app.getPath('userData'), 'handyfarm.db');
 const legacyJsonPath = path.join(app.getPath('userData'), 'devices.json');
 const deviceStore = new DeviceStore(sqliteDbPath, legacyJsonPath);
@@ -59,9 +61,16 @@ function broadcastDelta(deviceId: string, patch: Partial<DeviceData>, removed = 
  * Blocks if device is leased by another session, cooling down, quarantined, or in maintenance.
  */
 export function checkDeviceLeaseGuard(deviceId: string, sessionId?: string): { allowed: boolean; error?: string } {
+  let physId = deviceId;
   const dev = deviceStore.getDevice(deviceId);
-  if (!dev) return { allowed: true };
-  const physId = dev.physicalDeviceId || `phys_${dev.serial || dev.id}`;
+  if (dev) {
+    physId = dev.physicalDeviceId || `phys_${dev.serial || dev.id}`;
+  } else {
+    const mapping = deviceStore.getPhysicalMapping(deviceId);
+    if (mapping?.physicalDeviceId) {
+      physId = mapping.physicalDeviceId;
+    }
+  }
   const lease = deviceStore.getLease(physId);
 
   // If cooling_down, quarantined, or maintenance, reject immediately
@@ -233,6 +242,22 @@ app.whenReady().then(() => {
   }
   createWindow();
   startAdbTracker();
+
+  // Start Phase 7 loopback REST API server
+  startApiServer({
+    deviceStore,
+    client,
+    checkDeviceLeaseGuard,
+    isSafeAdbCommand,
+    isExpertMode: () => expertModeEnabled,
+    redactLogcatText,
+    broadcastDelta,
+    userDataDir: app.getPath('userData')
+  }).then((handle) => {
+    apiServerHandle = handle;
+  }).catch((err) => {
+    console.error('[API Server] Failed to start loopback REST API server:', err);
+  });
   
   app.on('activate', function () {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -248,6 +273,9 @@ app.on('before-quit', () => {
 });
 
 app.on('will-quit', () => {
+  if (apiServerHandle) {
+    apiServerHandle.close().catch(() => {});
+  }
   deviceStore.close();
 });
 
