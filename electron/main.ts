@@ -57,6 +57,13 @@ function broadcastDelta(deviceId: string, patch: Partial<DeviceData>, removed = 
 
 import { evaluateDeviceLeaseGuard } from './leaseGuard.js';
 import { validateDeviceConfigImport as validateConfigImport } from './configValidation.js';
+import {
+  captureDeviceManifest,
+  verifyDeviceAgainstBaseline,
+  executeFullBaselineReset,
+  type BaselineManifest,
+  type BaselineVerificationResult
+} from './baseline.js';
 
 /**
  * Guard function to enforce exclusive device lease access on destructive actions.
@@ -89,6 +96,40 @@ setInterval(() => {
     console.warn('[Lease Sweep] Error sweeping expired leases:', err);
   }
 }, 2000);
+
+// Background periodic drift detection sweep (§1.2 - every 60 seconds)
+async function sweepDeviceDrift() {
+  const activeDevices = deviceStore.getAllDevices(false).filter(d => d.status === 'device');
+  for (const dev of activeDevices) {
+    const physId = dev.physicalDeviceId || `phys_${dev.serial || dev.id}`;
+    const manifest = deviceStore.getBaseline(physId);
+    if (!manifest) continue;
+
+    // Skip intrusive sweep if device is currently leased by an active session
+    const lease = deviceStore.getLease(physId);
+    if (lease.state === 'leased') continue;
+
+    try {
+      const result = await verifyDeviceAgainstBaseline(dev.id, manifest, (args) => execFileAsync('adb', args));
+      deviceStore.recordDriftVerification(dev.id, result);
+      broadcastDelta(dev.id, {
+        baselineStatus: result.verified ? 'verified' : 'drifted',
+        driftCount: result.diffs.length,
+        driftWarnings: result.diffs.map(d => d.description || `${d.field}: expected ${JSON.stringify(d.expected)}, got ${JSON.stringify(d.actual)}`),
+        lastVerifiedAt: result.verifiedAt
+      });
+      if (!result.verified) {
+        console.warn(`[Drift Detection] Device ${dev.id} (${physId}) drifted: ${result.diffs.length} field(s) out of baseline.`);
+      }
+    } catch (err: any) {
+      console.warn(`[Drift Detection] Background verify failed for ${dev.id}:`, err?.message);
+    }
+  }
+}
+
+setInterval(() => {
+  sweepDeviceDrift().catch(() => {});
+}, 60000);
 
 // Run dedupe once on startup to clean up and merge any duplicates in the database
 const allInitialDevices = deviceStore.getAllDevices(false);
@@ -204,7 +245,10 @@ app.whenReady().then(() => {
     isExpertMode: () => expertModeEnabled,
     redactLogcatText,
     broadcastDelta,
-    userDataDir: app.getPath('userData')
+    userDataDir: app.getPath('userData'),
+    captureBaseline,
+    verifyBaseline,
+    resetToBaseline: resetDeviceToBaseline
   }).then((handle) => {
     apiServerHandle = handle;
   }).catch((err) => {
@@ -1331,69 +1375,128 @@ ipcMain.handle('get-mock-location', async (_event, deviceId: string) => {
   return await getMockLocation(deviceId);
 });
 
-async function resetDeviceToBaseline(deviceId: string): Promise<{
-  success: boolean;
-  companionReport?: any;
-  elevatedAdbActions?: string[];
-  error?: string;
-}> {
+export async function captureBaseline(deviceId: string): Promise<{ success: boolean; manifest?: BaselineManifest; error?: string }> {
   try {
-    await ensureClipperInstalled(deviceId);
-
-    // 1. Ask companion app to perform standalone resets and report drift
-    const stream = await client.getDevice(deviceId).shell(`am broadcast -a handyfarm.reset.baseline -n ${CLIPPER_RECEIVER}`);
-    const buffer = await Adb.util.readAll(stream);
-    const output = buffer.toString();
-    const prefix = 'data="';
-    const s = output.indexOf(prefix);
-    let companionReport: any = null;
-    if (s !== -1) {
-      const jsonStart = s + prefix.length;
-      const jsonEnd = output.lastIndexOf('}"');
-      if (jsonEnd > jsonStart) {
-        const jsonStr = output.substring(jsonStart, jsonEnd + 1);
-        try {
-          companionReport = JSON.parse(jsonStr);
-        } catch {
-          companionReport = { raw: jsonStr };
-        }
-      }
-    }
-
-    // 2. Perform elevated ADB resets that companion app legitimately lacks permission to perform
-    const elevatedAdbActions: string[] = [];
-
-    // Reset window and transition animations via ADB settings
-    try {
-      await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'global', 'window_animation_scale', '0']);
-      await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'global', 'transition_animation_scale', '0']);
-      await execFileAsync('adb', ['-s', deviceId, 'shell', 'settings', 'put', 'global', 'animator_duration_scale', '0']);
-      elevatedAdbActions.push('animations_disabled_via_adb');
-    } catch (e: any) {
-      console.warn(`[ResetBaseline] Failed to set animation scales via ADB on ${deviceId}:`, e?.message);
-    }
-
-    // Dismiss system dialogs and return to home screen
-    try {
-      await execFileAsync('adb', ['-s', deviceId, 'shell', 'am', 'broadcast', '-a', 'android.intent.action.CLOSE_SYSTEM_DIALOGS']).catch(() => {});
-      await execFileAsync('adb', ['-s', deviceId, 'shell', 'input', 'keyevent', '3']).catch(() => {});
-      elevatedAdbActions.push('system_dialogs_and_home_dismissed_via_adb');
-    } catch (e: any) {
-      console.warn(`[ResetBaseline] Failed to close dialogs via ADB on ${deviceId}:`, e?.message);
-    }
-
-    return {
-      success: true,
-      companionReport,
-      elevatedAdbActions
-    };
+    const dev = deviceStore.getDevice(deviceId);
+    const physId = dev?.physicalDeviceId || `phys_${dev?.serial || deviceId}`;
+    const manifest = await captureDeviceManifest(deviceId, physId, (args) => execFileAsync('adb', args));
+    deviceStore.saveBaseline(manifest);
+    deviceStore.logDeviceAction(deviceId, `Baseline manifest captured at ${new Date(manifest.capturedAt).toISOString()}`);
+    broadcastDelta(deviceId, {
+      baselineStatus: 'verified',
+      driftCount: 0,
+      driftWarnings: [],
+      lastBaselineAt: manifest.capturedAt,
+      lastVerifiedAt: manifest.capturedAt
+    });
+    return { success: true, manifest };
   } catch (err: any) {
     return { success: false, error: err?.message || String(err) };
   }
 }
 
-ipcMain.handle('reset-device-to-baseline', async (_event, deviceId: string) => {
-  return await resetDeviceToBaseline(deviceId);
+export async function verifyBaseline(deviceId: string): Promise<{ success: boolean; result?: BaselineVerificationResult; error?: string }> {
+  try {
+    const dev = deviceStore.getDevice(deviceId);
+    const physId = dev?.physicalDeviceId || `phys_${dev?.serial || deviceId}`;
+    const manifest = deviceStore.getBaseline(physId) || deviceStore.getBaseline(deviceId);
+    if (!manifest) {
+      return { success: false, error: `No baseline captured for device '${deviceId}'. Run baseline capture first.` };
+    }
+
+    const result = await verifyDeviceAgainstBaseline(deviceId, manifest, (args) => execFileAsync('adb', args));
+    deviceStore.recordDriftVerification(deviceId, result);
+    deviceStore.logDeviceAction(deviceId, `Baseline verified: ${result.verified ? 'OK (0 drift)' : `${result.diffs.length} drift items`}`);
+    broadcastDelta(deviceId, {
+      baselineStatus: result.verified ? 'verified' : 'drifted',
+      driftCount: result.diffs.length,
+      driftWarnings: result.diffs.map(d => d.description || `${d.field}: expected ${JSON.stringify(d.expected)}, got ${JSON.stringify(d.actual)}`),
+      lastVerifiedAt: result.verifiedAt
+    });
+    return { success: true, result };
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
+}
+
+/**
+ * FULL BASELINE RESET (§1.2 & §1.4).
+ * Replaces the legacy ephemeral-only reset.baseline (which only cleared mock location,
+ * clipboard, system dialogs, animation scales, and VPN).
+ *
+ * This is now a full verified baseline reset, NOT an ephemeral UI-state clear:
+ * 1. Enforces lease-guard to prevent execution conflicts during testing.
+ * 2. Clears app data via `pm clear` for all third-party apps (exempting first-party companion com.handyfarm.clipper).
+ * 3. Uninstalls any apps installed after baseline capture.
+ * 4. Revokes permissions granted beyond baseline.
+ * 5. Removes user accounts created since baseline.
+ * 6. Restores animation scales and system settings.
+ * 7. Executes companion app cleanup (mock location, clipboard, VPN).
+ * 8. Immediately runs verification to produce and broadcast a verified post-reset status.
+ */
+export async function resetDeviceToBaseline(deviceId: string, sessionId?: string): Promise<{
+  success: boolean;
+  actions?: string[];
+  verification?: BaselineVerificationResult;
+  error?: string;
+}> {
+  // 1. Enforce lease guard
+  const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
+  if (!leaseGuard.allowed) {
+    return { success: false, error: leaseGuard.error };
+  }
+
+  try {
+    await ensureClipperInstalled(deviceId);
+
+    const dev = deviceStore.getDevice(deviceId);
+    const physId = dev?.physicalDeviceId || `phys_${dev?.serial || deviceId}`;
+    const manifest = deviceStore.getBaseline(physId) || deviceStore.getBaseline(deviceId);
+
+    const broadcastReset = async () => {
+      const stream = await client.getDevice(deviceId).shell(`am broadcast -a handyfarm.reset.baseline -n ${CLIPPER_RECEIVER}`);
+      await Adb.util.readAll(stream);
+    };
+
+    const resetResult = await executeFullBaselineReset(
+      deviceId,
+      manifest,
+      (args) => execFileAsync('adb', args),
+      broadcastReset
+    );
+
+    if (resetResult.verification) {
+      deviceStore.recordDriftVerification(deviceId, resetResult.verification);
+      broadcastDelta(deviceId, {
+        baselineStatus: resetResult.verification.verified ? 'verified' : 'drifted',
+        driftCount: resetResult.verification.diffs.length,
+        driftWarnings: resetResult.verification.diffs.map(d => d.description || `${d.field}: expected ${JSON.stringify(d.expected)}, got ${JSON.stringify(d.actual)}`),
+        lastVerifiedAt: resetResult.verification.verifiedAt
+      });
+    }
+
+    deviceStore.logDeviceAction(deviceId, `Full baseline reset executed (${resetResult.actions.length} actions)`);
+
+    return resetResult;
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
+}
+
+ipcMain.handle('capture-device-baseline', async (_event, deviceId: string) => {
+  return await captureBaseline(deviceId);
+});
+
+ipcMain.handle('verify-device-baseline', async (_event, deviceId: string) => {
+  return await verifyBaseline(deviceId);
+});
+
+ipcMain.handle('reset-device-to-baseline', async (_event, deviceId: string, sessionId?: string) => {
+  return await resetDeviceToBaseline(deviceId, sessionId);
+});
+
+ipcMain.handle('get-device-baseline', async (_event, deviceId: string) => {
+  return deviceStore.getBaseline(deviceId);
 });
 
 async function getVpnStatus(deviceId: string): Promise<{ success: boolean; status?: any; error?: string }> {

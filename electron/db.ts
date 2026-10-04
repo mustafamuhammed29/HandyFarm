@@ -35,12 +35,20 @@ export interface DeviceData {
   leasedBy?: string;
   leaseExpiresAt?: number;
   lastHeartbeatAt?: number;
+  baselineStatus?: 'verified' | 'drifted' | 'unbaselined';
+  driftCount?: number;
+  driftWarnings?: string[];
+  lastVerifiedAt?: number;
+  lastBaselineAt?: number;
 }
 
 import type { PhysicalDeviceMapping, DeviceHardwareProps } from './identity.js';
 import { generatePhysicalDeviceId } from './identity.js';
 export type { PhysicalDeviceMapping, DeviceHardwareProps };
 export { generatePhysicalDeviceId };
+
+import type { BaselineManifest, BaselineVerificationResult } from './baseline.js';
+export type { BaselineManifest, BaselineVerificationResult };
 
 // -------------------------------------------------------------
 // In-Memory Bounded LRU Thumbnail Cache
@@ -127,6 +135,10 @@ export class DeviceStore {
   private stmtUpsertLease!: Database.Statement;
   private stmtGetLease!: Database.Statement;
   private stmtGetAllLeases!: Database.Statement;
+  private stmtUpsertBaseline!: Database.Statement;
+  private stmtGetBaseline!: Database.Statement;
+  private stmtGetAllBaselines!: Database.Statement;
+  private stmtDeleteBaseline!: Database.Statement;
 
   constructor(dbPath: string, jsonBackupPath?: string) {
     const dir = path.dirname(dbPath);
@@ -207,6 +219,15 @@ export class DeviceStore {
         updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_leases_state ON leases(lease_state);
+
+      CREATE TABLE IF NOT EXISTS device_baselines (
+        physical_device_id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        manifest_json TEXT NOT NULL,
+        captured_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_baselines_device_id ON device_baselines(device_id);
     `);
 
     // Ensure physical_device_id column exists if table was created in an earlier migration
@@ -228,7 +249,23 @@ export class DeviceStore {
     if (!cols.some(c => c.name === 'last_heartbeat_at')) {
       this.db.exec('ALTER TABLE devices ADD COLUMN last_heartbeat_at INTEGER;');
     }
+    if (!cols.some(c => c.name === 'baseline_status')) {
+      this.db.exec("ALTER TABLE devices ADD COLUMN baseline_status TEXT DEFAULT 'unbaselined';");
+    }
+    if (!cols.some(c => c.name === 'drift_count')) {
+      this.db.exec('ALTER TABLE devices ADD COLUMN drift_count INTEGER DEFAULT 0;');
+    }
+    if (!cols.some(c => c.name === 'drift_warnings')) {
+      this.db.exec('ALTER TABLE devices ADD COLUMN drift_warnings TEXT;');
+    }
+    if (!cols.some(c => c.name === 'last_verified_at')) {
+      this.db.exec('ALTER TABLE devices ADD COLUMN last_verified_at INTEGER;');
+    }
+    if (!cols.some(c => c.name === 'last_baseline_at')) {
+      this.db.exec('ALTER TABLE devices ADD COLUMN last_baseline_at INTEGER;');
+    }
     this.db.exec("UPDATE devices SET lease_state = 'available' WHERE lease_state IS NULL OR lease_state = '';");
+    this.db.exec("UPDATE devices SET baseline_status = 'unbaselined' WHERE baseline_status IS NULL OR baseline_status = '';");
   }
 
   private prepareStatements() {
@@ -236,11 +273,15 @@ export class DeviceStore {
       INSERT INTO devices (
         id, physical_device_id, serial, status, model, manufacturer, name, custom_name, notes,
         is_bare_board, tags, connected_at, last_known_ip, battery_level, battery_charging,
-        lease_state, leased_by, lease_expires_at, last_heartbeat_at, updated_at
+        lease_state, leased_by, lease_expires_at, last_heartbeat_at,
+        baseline_status, drift_count, drift_warnings, last_verified_at, last_baseline_at,
+        updated_at
       ) VALUES (
         @id, @physicalDeviceId, @serial, @status, @model, @manufacturer, @name, @customName, @notes,
         @isBareBoard, @tags, @connectedAt, @lastKnownIp, @batteryLevel, @batteryCharging,
-        @leaseState, @leasedBy, @leaseExpiresAt, @lastHeartbeatAt, @updatedAt
+        @leaseState, @leasedBy, @leaseExpiresAt, @lastHeartbeatAt,
+        @baselineStatus, @driftCount, @driftWarnings, @lastVerifiedAt, @lastBaselineAt,
+        @updatedAt
       )
       ON CONFLICT(id) DO UPDATE SET
         physical_device_id = COALESCE(excluded.physical_device_id, devices.physical_device_id),
@@ -261,6 +302,11 @@ export class DeviceStore {
         leased_by = excluded.leased_by,
         lease_expires_at = excluded.lease_expires_at,
         last_heartbeat_at = excluded.last_heartbeat_at,
+        baseline_status = COALESCE(excluded.baseline_status, devices.baseline_status),
+        drift_count = COALESCE(excluded.drift_count, devices.drift_count),
+        drift_warnings = COALESCE(excluded.drift_warnings, devices.drift_warnings),
+        last_verified_at = COALESCE(excluded.last_verified_at, devices.last_verified_at),
+        last_baseline_at = COALESCE(excluded.last_baseline_at, devices.last_baseline_at),
         updated_at = excluded.updated_at
     `);
 
@@ -313,6 +359,24 @@ export class DeviceStore {
     `);
     this.stmtGetLease = this.db.prepare(`SELECT * FROM leases WHERE physical_device_id = ?`);
     this.stmtGetAllLeases = this.db.prepare(`SELECT * FROM leases`);
+
+    this.stmtUpsertBaseline = this.db.prepare(`
+      INSERT INTO device_baselines (
+        physical_device_id, device_id, manifest_json, captured_at, updated_at
+      ) VALUES (
+        @physicalDeviceId, @deviceId, @manifestJson, @capturedAt, @updatedAt
+      )
+      ON CONFLICT(physical_device_id) DO UPDATE SET
+        device_id = excluded.device_id,
+        manifest_json = excluded.manifest_json,
+        captured_at = excluded.captured_at,
+        updated_at = excluded.updated_at
+    `);
+    this.stmtGetBaseline = this.db.prepare(`
+      SELECT * FROM device_baselines WHERE physical_device_id = ? OR device_id = ?
+    `);
+    this.stmtGetAllBaselines = this.db.prepare(`SELECT * FROM device_baselines`);
+    this.stmtDeleteBaseline = this.db.prepare(`DELETE FROM device_baselines WHERE physical_device_id = ?`);
   }
 
   private migrateFromJsonIfEmpty(jsonPath: string) {
@@ -426,6 +490,11 @@ export class DeviceStore {
         this.leases.set(physId, lease);
       }
 
+      let driftWarnings: string[] = [];
+      try {
+        if (r.drift_warnings) driftWarnings = JSON.parse(r.drift_warnings);
+      } catch {}
+
       const dev: DeviceData = {
         id: r.id,
         physicalDeviceId: physId,
@@ -447,6 +516,11 @@ export class DeviceStore {
         leasedBy: lease.leasedBy,
         leaseExpiresAt: lease.leaseExpiresAt,
         lastHeartbeatAt: lease.lastHeartbeatAt,
+        baselineStatus: (r.baseline_status as any) || 'unbaselined',
+        driftCount: r.drift_count || 0,
+        driftWarnings,
+        lastVerifiedAt: r.last_verified_at || undefined,
+        lastBaselineAt: r.last_baseline_at || undefined,
         history
       };
 
@@ -780,6 +854,11 @@ export class DeviceStore {
             leasedBy: patch.leasedBy !== undefined ? patch.leasedBy : (current.leasedBy ?? null),
             leaseExpiresAt: patch.leaseExpiresAt !== undefined ? patch.leaseExpiresAt : (current.leaseExpiresAt ?? null),
             lastHeartbeatAt: patch.lastHeartbeatAt !== undefined ? patch.lastHeartbeatAt : (current.lastHeartbeatAt ?? null),
+            baselineStatus: patch.baselineStatus ?? current.baselineStatus ?? 'unbaselined',
+            driftCount: patch.driftCount ?? current.driftCount ?? 0,
+            driftWarnings: (patch.driftWarnings || current.driftWarnings) ? JSON.stringify(patch.driftWarnings || current.driftWarnings) : null,
+            lastVerifiedAt: patch.lastVerifiedAt ?? current.lastVerifiedAt ?? null,
+            lastBaselineAt: patch.lastBaselineAt ?? current.lastBaselineAt ?? null,
             updatedAt: now
           });
         }
@@ -1028,6 +1107,74 @@ export class DeviceStore {
       if (dev.physicalDeviceId === physicalDeviceId || dev.serial === physicalDeviceId) {
         this.logDeviceAction(dev.id, action);
       }
+    }
+  }
+
+  // --- Phase 1: Baseline Manifest & Drift Tracking ---
+
+  saveBaseline(manifest: BaselineManifest): void {
+    const now = Date.now();
+    this.stmtUpsertBaseline.run({
+      physicalDeviceId: manifest.physicalDeviceId,
+      deviceId: manifest.deviceId,
+      manifestJson: JSON.stringify(manifest),
+      capturedAt: manifest.capturedAt,
+      updatedAt: now
+    });
+
+    const dev = this.inMemoryDevices.get(manifest.deviceId);
+    if (dev) {
+      dev.baselineStatus = 'verified';
+      dev.driftCount = 0;
+      dev.driftWarnings = [];
+      dev.lastBaselineAt = manifest.capturedAt;
+      dev.lastVerifiedAt = manifest.capturedAt;
+      const pending = this.pendingWrites.get(manifest.deviceId) || {};
+      this.pendingWrites.set(manifest.deviceId, { ...pending, ...dev });
+      this.scheduleDebouncedFlush();
+    }
+  }
+
+  getBaseline(physicalDeviceIdOrDeviceId: string): BaselineManifest | undefined {
+    let physId = physicalDeviceIdOrDeviceId;
+    const dev = this.inMemoryDevices.get(physicalDeviceIdOrDeviceId);
+    if (dev?.physicalDeviceId) physId = dev.physicalDeviceId;
+
+    try {
+      const row = this.stmtGetBaseline.get(physId, physicalDeviceIdOrDeviceId) as any;
+      if (row?.manifest_json) {
+        return JSON.parse(row.manifest_json) as BaselineManifest;
+      }
+    } catch (e) {
+      console.warn(`[DeviceStore] Failed to load baseline for ${physicalDeviceIdOrDeviceId}:`, e);
+    }
+    return undefined;
+  }
+
+  deleteBaseline(physicalDeviceId: string): boolean {
+    const res = this.stmtDeleteBaseline.run(physicalDeviceId);
+    return res.changes > 0;
+  }
+
+  getAllBaselines(): BaselineManifest[] {
+    try {
+      const rows = this.stmtGetAllBaselines.all() as any[];
+      return rows.map(r => JSON.parse(r.manifest_json));
+    } catch {
+      return [];
+    }
+  }
+
+  recordDriftVerification(deviceId: string, result: BaselineVerificationResult): void {
+    const dev = this.inMemoryDevices.get(deviceId);
+    if (dev) {
+      dev.baselineStatus = result.verified ? 'verified' : 'drifted';
+      dev.driftCount = result.diffs.length;
+      dev.driftWarnings = result.diffs.map(d => d.description || `${d.field}: expected ${JSON.stringify(d.expected)}, got ${JSON.stringify(d.actual)}`);
+      dev.lastVerifiedAt = result.verifiedAt;
+      const pending = this.pendingWrites.get(deviceId) || {};
+      this.pendingWrites.set(deviceId, { ...pending, ...dev });
+      this.scheduleDebouncedFlush();
     }
   }
 

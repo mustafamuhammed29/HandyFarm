@@ -28,6 +28,11 @@ export interface DeviceData {
   leasedBy?: string;
   leaseExpiresAt?: number;
   lastHeartbeatAt?: number;
+  baselineStatus?: 'verified' | 'drifted' | 'unbaselined';
+  driftCount?: number;
+  driftWarnings?: string[];
+  lastVerifiedAt?: number;
+  lastBaselineAt?: number;
 }
 
 export interface QuickPhrase {
@@ -97,7 +102,10 @@ declare global {
       getForegroundApp: (deviceId: string) => Promise<{success: boolean, packageName?: string, error?: string, permissionRequired?: boolean}>;
       setMockLocation: (deviceId: string, lat: number, lng: number) => Promise<{success: boolean, error?: string, permissionRequired?: boolean}>;
       getMockLocation: (deviceId: string) => Promise<{success: boolean, lat?: number, lng?: number, mockAllowed?: boolean, error?: string}>;
-      resetDeviceToBaseline: (deviceId: string) => Promise<{success: boolean, companionReport?: any, elevatedAdbActions?: string[], error?: string}>;
+      resetDeviceToBaseline: (deviceId: string, sessionId?: string) => Promise<{success: boolean, actions?: string[], verification?: any, error?: string}>;
+      captureDeviceBaseline?: (deviceId: string) => Promise<{success: boolean, manifest?: any, error?: string}>;
+      verifyDeviceBaseline?: (deviceId: string) => Promise<{success: boolean, result?: any, error?: string}>;
+      getDeviceBaseline?: (deviceId: string) => Promise<any>;
       connectVpn: (deviceId: string, config: VpnConfig) => Promise<{success: boolean, status?: VpnStatus, error?: string}>;
       disconnectVpn: (deviceId: string) => Promise<{success: boolean, status?: VpnStatus, error?: string}>;
       getVpnStatus: (deviceId: string) => Promise<{success: boolean, status?: VpnStatus, error?: string}>;

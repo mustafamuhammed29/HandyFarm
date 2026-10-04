@@ -197,6 +197,19 @@ Commands:
   artifacts                   Retrieve artifacts metadata placeholder
     --device <id>               Device ID (required)
 
+  baseline capture            Capture baseline manifest for a device at a known-good moment
+    --device <id>               Device ID (required)
+
+  baseline verify             Verify device state against baseline, returning structured diff
+    --device <id>               Device ID (required)
+
+  baseline reset              Execute full verified reset to baseline state
+    --device <id>               Device ID (required)
+    --session <id>              Lease session ID (if device is leased)
+
+  baseline show               Show stored baseline manifest for a device
+    --device <id>               Device ID (required)
+
 Global Options:
   --json                      Output raw JSON responses
   --auth-file <path>          Path to api-auth.json credential file
@@ -204,6 +217,9 @@ Global Options:
 
 Examples:
   handyfarm devices list
+  handyfarm baseline capture --device 106293738O006649
+  handyfarm baseline verify --device 106293738O006649
+  handyfarm baseline reset --device 106293738O006649
   handyfarm lease --device 106293738O006649 --ttl 30m
   handyfarm shell --device 106293738O006649 --cmd "getprop ro.build.version.release"
   handyfarm release --device 106293738O006649
@@ -455,6 +471,145 @@ async function main() {
 
     console.log(JSON.stringify(res.data, null, 2));
     process.exit(res.ok ? 0 : 1);
+  }
+
+  // --- Phase 1: Baseline CLI Commands ---
+
+  const isBaselineCmd = primaryCmd === 'baseline' ||
+    (primaryCmd === 'verify' && (flags.against === 'baseline' || positional[1] === 'baseline')) ||
+    (primaryCmd === 'reset' && (flags.to === 'baseline' || positional[1] === 'baseline'));
+
+  if (isBaselineCmd) {
+    let subAction = positional[1] ? positional[1].toLowerCase() : '';
+    if (primaryCmd === 'verify') subAction = 'verify';
+    if (primaryCmd === 'reset') subAction = 'reset';
+    if (primaryCmd === 'baseline' && !subAction) subAction = positional[2] || 'show';
+
+    const deviceId = flags.device || flags.d || (primaryCmd === 'baseline' ? positional[2] : positional[1]);
+
+    if (!deviceId) {
+      console.error('Error: --device <id> is required for baseline operations.');
+      process.exit(1);
+    }
+
+    // Capture Baseline
+    if (subAction === 'capture') {
+      console.log(`Capturing baseline manifest for device '${deviceId}'...`);
+      const res = await apiRequest(`/devices/${encodeURIComponent(deviceId)}/baseline/capture`, {
+        method: 'POST'
+      }, auth);
+
+      if (flags.json) {
+        console.log(JSON.stringify(res.data, null, 2));
+        process.exit(res.ok ? 0 : 1);
+      }
+
+      if (!res.ok) {
+        console.error(`\n[Baseline Capture Error] (${res.status}): ${res.data?.error || JSON.stringify(res.data)}\n`);
+        process.exit(1);
+      }
+
+      const m = res.data.manifest;
+      console.log(`\n✓ Baseline manifest captured for device '${deviceId}' (${m.physicalDeviceId}):`);
+      console.log(`  Captured At:      ${new Date(m.capturedAt).toLocaleString()}`);
+      console.log(`  Model / Hardware: ${m.immutable?.model || 'unknown'} (${m.immutable?.screen?.size || 'unknown'})`);
+      console.log(`  Packages Count:   ${m.mutable?.installedPackages?.length || 0} packages recorded`);
+      console.log(`  Accounts Count:   ${m.mutable?.accounts?.length || 0} user accounts recorded\n`);
+      return;
+    }
+
+    // Verify against Baseline
+    if (subAction === 'verify') {
+      console.log(`Verifying device '${deviceId}' against baseline...`);
+      const res = await apiRequest(`/devices/${encodeURIComponent(deviceId)}/baseline/verify`, {
+        method: 'GET'
+      }, auth);
+
+      if (flags.json) {
+        console.log(JSON.stringify(res.data, null, 2));
+        process.exit(res.ok ? 0 : 1);
+      }
+
+      if (!res.ok) {
+        console.error(`\n[Baseline Verify Error] (${res.status}): ${res.data?.error || JSON.stringify(res.data)}\n`);
+        process.exit(1);
+      }
+
+      const v = res.data;
+      if (v.clockVerification) {
+        const c = v.clockVerification;
+        const status = c.bounded ? 'OK (NTP synced)' : 'WARNING: Out of bounds (> ±2000ms or auto_time off)';
+        console.log(`  Clock verification: ${c.offsetMs}ms offset [${status}]`);
+      }
+
+      if (v.verified && v.diffs.length === 0) {
+        console.log(`\n✓ Device '${deviceId}' verified against baseline with 0 drift.\n`);
+      } else {
+        console.log(`\n⚠ Device '${deviceId}' DRIFT DETECTED: ${v.diffs.length} field(s) drifted:\n`);
+        console.log(`  ${'Field'.padEnd(45)} ${'Class'.padEnd(12)} ${'Expected'.padEnd(25)} ${'Actual'.padEnd(25)}`);
+        console.log(`  ${'-'.repeat(45)} ${'-'.repeat(12)} ${'-'.repeat(25)} ${'-'.repeat(25)}`);
+        for (const d of v.diffs) {
+          const expStr = String(d.expected ?? 'null').slice(0, 24);
+          const actStr = String(d.actual ?? 'null').slice(0, 24);
+          console.log(`  ${d.field.padEnd(45)} ${d.drift_class.padEnd(12)} ${expStr.padEnd(25)} ${actStr.padEnd(25)}`);
+        }
+        console.log();
+      }
+      return;
+    }
+
+    // Reset to Baseline
+    if (subAction === 'reset') {
+      const sessionId = flags.session || undefined;
+      console.log(`Executing full baseline reset on device '${deviceId}'...`);
+      const res = await apiRequest(`/devices/${encodeURIComponent(deviceId)}/baseline/reset`, {
+        method: 'POST',
+        body: { sessionId }
+      }, auth);
+
+      if (flags.json) {
+        console.log(JSON.stringify(res.data, null, 2));
+        process.exit(res.ok ? 0 : 1);
+      }
+
+      if (!res.ok) {
+        console.error(`\n[Baseline Reset Error] (${res.status}): ${res.data?.error || JSON.stringify(res.data)}\n`);
+        process.exit(1);
+      }
+
+      console.log(`\n✓ Full baseline reset executed on device '${deviceId}':`);
+      for (const act of (res.data.actions || [])) {
+        console.log(`  • ${act}`);
+      }
+
+      if (res.data.verification) {
+        const v = res.data.verification;
+        console.log(`\n  Post-Reset Verification: ${v.verified ? 'PASSED (0 drift)' : `DRIFT REMAINING (${v.diffs.length} diffs)`}\n`);
+      } else {
+        console.log();
+      }
+      return;
+    }
+
+    // Show Baseline
+    if (subAction === 'show' || subAction === 'get') {
+      const res = await apiRequest(`/devices/${encodeURIComponent(deviceId)}/baseline`, {
+        method: 'GET'
+      }, auth);
+
+      if (flags.json) {
+        console.log(JSON.stringify(res.data, null, 2));
+        process.exit(res.ok ? 0 : 1);
+      }
+
+      if (!res.ok) {
+        console.error(`\n[Baseline Error] (${res.status}): ${res.data?.error || JSON.stringify(res.data)}\n`);
+        process.exit(1);
+      }
+
+      console.log(JSON.stringify(res.data.manifest, null, 2));
+      return;
+    }
   }
 
   console.error(`Unknown command: '${primaryCmd}'. Run 'handyfarm --help' for usage.`);

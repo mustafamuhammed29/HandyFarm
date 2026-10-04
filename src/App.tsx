@@ -978,6 +978,32 @@ function App() {
                         </span>
                       );
                     })()}
+
+                    {/* Phase 1: Baseline Status Badge */}
+                    {(() => {
+                      const bStatus = device.baselineStatus || 'unbaselined';
+                      if (bStatus === 'verified') {
+                        return (
+                          <span className="baseline-badge verified" title="Verified against baseline (0 drift)">
+                            ✓ Baseline
+                          </span>
+                        );
+                      }
+                      if (bStatus === 'drifted') {
+                        const count = device.driftCount || 1;
+                        const warnings = (device.driftWarnings || []).join('\n');
+                        return (
+                          <span className="baseline-badge drifted" title={`Drift detected (${count} fields):\n${warnings}`}>
+                            ⚠️ Drift ({count})
+                          </span>
+                        );
+                      }
+                      return (
+                        <span className="baseline-badge unbaselined" title="No baseline manifest recorded yet">
+                          No Baseline
+                        </span>
+                      );
+                    })()}
                   </div>
                 </div>
 
@@ -1417,6 +1443,89 @@ function App() {
                     }}
                   >Maintenance</button>
                 </div>
+              </div>
+            </div>
+
+            {/* Phase 1: Verified State Baseline & Drift Controls */}
+            <div className="form-group" style={{ background: 'var(--bg-color)', padding: '12px', borderRadius: '6px', border: '1px solid var(--border)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                <label style={{ margin: 0, fontWeight: 600, fontSize: '12px' }}>Verified Baseline & Drift</label>
+                <span className={`baseline-badge ${settingsDevice.baselineStatus || 'unbaselined'}`}>
+                  {settingsDevice.baselineStatus === 'verified' && '✓ Baseline OK'}
+                  {settingsDevice.baselineStatus === 'drifted' && `⚠️ Drift (${settingsDevice.driftCount || 1})`}
+                  {(!settingsDevice.baselineStatus || settingsDevice.baselineStatus === 'unbaselined') && 'No Baseline'}
+                </span>
+              </div>
+
+              {settingsDevice.lastBaselineAt && (
+                <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginBottom: '8px' }}>
+                  Captured: {new Date(settingsDevice.lastBaselineAt).toLocaleString()}
+                  {settingsDevice.lastVerifiedAt && ` • Last Checked: ${new Date(settingsDevice.lastVerifiedAt).toLocaleTimeString()}`}
+                </div>
+              )}
+
+              {settingsDevice.driftWarnings && settingsDevice.driftWarnings.length > 0 && (
+                <div style={{ maxHeight: '100px', overflowY: 'auto', background: 'rgba(239, 68, 68, 0.08)', border: '1px solid rgba(239, 68, 68, 0.25)', borderRadius: '4px', padding: '6px 8px', marginBottom: '8px', fontSize: '11px', color: '#f87171' }}>
+                  <div style={{ fontWeight: 600, marginBottom: '4px' }}>Detected Drift:</div>
+                  {settingsDevice.driftWarnings.map((w, idx) => (
+                    <div key={idx} style={{ marginBottom: '2px' }}>• {w}</div>
+                  ))}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  style={{ fontSize: '11px', padding: '4px 8px', background: 'var(--surface-color)', border: '1px solid var(--border)', borderRadius: '4px', cursor: 'pointer' }}
+                  onClick={async () => {
+                    const res = await window.electronAPI.captureDeviceBaseline?.(settingsDevice.id);
+                    if (res?.success) {
+                      setSettingsDevice({ ...settingsDevice, baselineStatus: 'verified', driftCount: 0, driftWarnings: [], lastBaselineAt: Date.now(), lastVerifiedAt: Date.now() });
+                      alert('✓ Baseline manifest captured successfully.');
+                    } else {
+                      alert(`Baseline capture failed: ${res?.error}`);
+                    }
+                  }}
+                >Capture Baseline</button>
+
+                <button
+                  type="button"
+                  style={{ fontSize: '11px', padding: '4px 8px', background: 'var(--surface-color)', border: '1px solid var(--border)', borderRadius: '4px', cursor: 'pointer' }}
+                  onClick={async () => {
+                    const res = await window.electronAPI.verifyDeviceBaseline?.(settingsDevice.id);
+                    if (res?.success && res.result) {
+                      const v = res.result;
+                      const warnings = v.diffs.map((d: any) => d.description || `${d.field}: expected ${d.expected}, got ${d.actual}`);
+                      setSettingsDevice({ ...settingsDevice, baselineStatus: v.verified ? 'verified' : 'drifted', driftCount: v.diffs.length, driftWarnings: warnings, lastVerifiedAt: v.verifiedAt });
+                      if (v.verified) {
+                        alert('✓ Verification passed: Device matches baseline (0 drift).');
+                      } else {
+                        alert(`⚠️ Drift detected: ${v.diffs.length} field(s) drifted from baseline.`);
+                      }
+                    } else {
+                      alert(`Verification failed: ${res?.error}`);
+                    }
+                  }}
+                >Verify State</button>
+
+                <button
+                  type="button"
+                  style={{ fontSize: '11px', padding: '4px 8px', background: 'rgba(239, 68, 68, 0.1)', color: 'var(--danger)', border: '1px solid rgba(239, 68, 68, 0.3)', borderRadius: '4px', cursor: 'pointer' }}
+                  onClick={async () => {
+                    if (!confirm(`Are you sure you want to execute a full baseline reset on ${settingsDevice.customName || settingsDevice.id}?\n\nThis will pm-clear app data, uninstall post-baseline packages, revoke extra permissions, and restore baseline settings.`)) return;
+                    const res = await window.electronAPI.resetDeviceToBaseline(settingsDevice.id);
+                    if (res?.success) {
+                      if (res.verification) {
+                        const v = res.verification;
+                        const warnings = v.diffs.map((d: any) => d.description || `${d.field}: expected ${d.expected}, got ${d.actual}`);
+                        setSettingsDevice({ ...settingsDevice, baselineStatus: v.verified ? 'verified' : 'drifted', driftCount: v.diffs.length, driftWarnings: warnings, lastVerifiedAt: v.verifiedAt });
+                      }
+                      alert(`✓ Full baseline reset completed (${res.actions?.length || 0} actions performed).`);
+                    } else {
+                      alert(`Reset failed: ${res?.error}`);
+                    }
+                  }}
+                >Reset to Baseline</button>
               </div>
             </div>
 

@@ -18,6 +18,9 @@ export interface ApiServerOptions {
   userDataDir: string;
   port?: number;
   host?: string; // Strictly 127.0.0.1
+  captureBaseline?: (deviceId: string) => Promise<{ success: boolean; manifest?: any; error?: string }>;
+  verifyBaseline?: (deviceId: string) => Promise<{ success: boolean; result?: any; error?: string }>;
+  resetToBaseline?: (deviceId: string, sessionId?: string) => Promise<{ success: boolean; actions?: string[]; verification?: any; error?: string }>;
 }
 
 export interface ApiServerHandle {
@@ -451,7 +454,62 @@ export async function startApiServer(options: ApiServerOptions): Promise<ApiServ
         }
       }
 
-      // 8. GET /devices/:id/artifacts (Placeholder for future screenshot/log retrieval)
+      // --- Phase 1 Baseline Endpoints ---
+
+      // 8. POST /devices/:id/baseline/capture (Capture baseline manifest at known-good moment)
+      const baselineCaptureMatch = pathname.match(/^\/devices\/([^/]+)\/baseline\/capture\/?$/);
+      if (baselineCaptureMatch && method === 'POST') {
+        const rawId = decodeURIComponent(baselineCaptureMatch[1]);
+        if (!options.captureBaseline) {
+          return sendJson(res, 501, { success: false, error: 'Baseline capture is not configured on this server' });
+        }
+        const result = await options.captureBaseline(rawId);
+        return sendJson(res, result.success ? 200 : 500, result);
+      }
+
+      // 9. GET /devices/:id/baseline/verify (Verify current state against stored baseline)
+      const baselineVerifyMatch = pathname.match(/^\/devices\/([^/]+)\/baseline\/verify\/?$/);
+      if (baselineVerifyMatch && method === 'GET') {
+        const rawId = decodeURIComponent(baselineVerifyMatch[1]);
+        if (!options.verifyBaseline) {
+          return sendJson(res, 501, { success: false, error: 'Baseline verification is not configured on this server' });
+        }
+        const result = await options.verifyBaseline(rawId);
+        return sendJson(res, result.success ? 200 : 404, result);
+      }
+
+      // 10. POST /devices/:id/baseline/reset (Execute full baseline reset respecting lease guard)
+      const baselineResetMatch = pathname.match(/^\/devices\/([^/]+)\/baseline\/reset\/?$/);
+      if (baselineResetMatch && method === 'POST') {
+        const rawId = decodeURIComponent(baselineResetMatch[1]);
+        const body = await parseJsonBody(req);
+
+        // Enforce lease guard
+        const leaseGuard = checkDeviceLeaseGuard(rawId, body.sessionId);
+        if (!leaseGuard.allowed) {
+          return sendJson(res, 403, { success: false, error: leaseGuard.error });
+        }
+
+        if (!options.resetToBaseline) {
+          return sendJson(res, 501, { success: false, error: 'Baseline reset is not configured on this server' });
+        }
+
+        const result = await options.resetToBaseline(rawId, body.sessionId);
+        return sendJson(res, result.success ? 200 : 500, result);
+      }
+
+      // 11. GET /devices/:id/baseline (Fetch stored baseline manifest)
+      const baselineGetMatch = pathname.match(/^\/devices\/([^/]+)\/baseline\/?$/);
+      if (baselineGetMatch && method === 'GET') {
+        const rawId = decodeURIComponent(baselineGetMatch[1]);
+        const manifest = deviceStore.getBaseline(rawId);
+        if (!manifest) {
+          return sendJson(res, 404, { success: false, error: `No baseline found for device '${rawId}'` });
+        }
+        return sendJson(res, 200, { success: true, manifest });
+      }
+
+      // 12. GET /devices/:id/artifacts (Placeholder for future screenshot/log retrieval)
       const artifactsMatch = pathname.match(/^\/devices\/([^/]+)\/artifacts\/?$/);
       if (artifactsMatch && method === 'GET') {
         const rawId = decodeURIComponent(artifactsMatch[1]);
