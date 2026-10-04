@@ -253,6 +253,30 @@ function App() {
       console.log(`Device ID: ${d.id} | Serial: ${d.serial} | Status: ${d.status} | Passes Filter? ${isVisible}`);
       return isVisible;
     });
+
+    // Enforce exactly 1 tile per physical device in UI by physicalDeviceId and serial
+    const seenPhysicalIds = new Set<string>();
+    const seenSerials = new Set<string>();
+    const deduped: DeviceData[] = [];
+
+    // Sort active devices first, then newest connection first so the active transport takes precedence
+    const candidateList = [...filtered].sort((a, b) => {
+      const aActive = a.status === 'device' ? 1 : 0;
+      const bActive = b.status === 'device' ? 1 : 0;
+      if (aActive !== bActive) return bActive - aActive;
+      return (b.connectedAt || 0) - (a.connectedAt || 0);
+    });
+
+    for (const d of candidateList) {
+      const pId = d.physicalDeviceId;
+      const sId = d.serial;
+      if (pId && seenPhysicalIds.has(pId)) continue;
+      if (sId && seenSerials.has(sId)) continue;
+      if (pId) seenPhysicalIds.add(pId);
+      if (sId) seenSerials.add(sId);
+      deduped.push(d);
+    }
+    filtered = deduped;
     
     if (activeTagFilter) {
       filtered = filtered.filter(d => d.tags?.includes(activeTagFilter));
@@ -1168,6 +1192,31 @@ function App() {
                 }}>Send Only Here</button>
               </div>
             </div>
+
+            {!settingsDevice.id.includes(':') && (
+              <div className="form-group" style={{borderTop: '1px solid var(--border)', paddingTop: '16px'}}>
+                <label>Wireless Connection</label>
+                <button 
+                  className="secondary-btn"
+                  id="btnSwitchToWireless"
+                  style={{display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', padding: '8px', width: '100%'}}
+                  disabled={actionInProgress}
+                  onClick={async () => {
+                    setActionInProgress(true);
+                    const res = await window.electronAPI.switchToWireless(settingsDevice.id);
+                    setActionInProgress(false);
+                    if (res.success) {
+                      setGlobalMessage(`Switched to Wireless (${res.ip}:5555)`);
+                      setSettingsDevice(null);
+                    } else {
+                      alert(`Failed to switch to wireless: ${res.error}`);
+                    }
+                  }}
+                >
+                  <Wifi size={16} /> Switch to Wireless ADB
+                </button>
+              </div>
+            )}
 
             <div className="modal-actions" style={{borderTop: '1px solid var(--border)', paddingTop: '16px'}}>
               <button onClick={() => setSettingsDevice(null)}>Cancel</button>

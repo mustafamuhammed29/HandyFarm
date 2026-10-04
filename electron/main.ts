@@ -207,25 +207,53 @@ async function startAdbTracker() {
     tracker.on('add', (device: any) => {
       console.log('Device added:', device.id, device.type);
       const dev = deviceStore.getDevice(device.id);
+
+      // Pre-match against known devices to prevent transient duplicate tiles
+      let matchedDev = dev;
+      if (!matchedDev) {
+        const allDevs = deviceStore.getAllDevices(false);
+        if (device.id.includes(':')) {
+          const ip = device.id.split(':')[0];
+          matchedDev = allDevs.find(d => d.lastKnownIp === ip);
+        } else {
+          matchedDev = allDevs.find(d => d.serial === device.id || d.id === device.id);
+        }
+      }
+
       const patch: Partial<DeviceData> = {
         status: device.type,
         connectedAt: Date.now(),
-        serial: dev?.serial || device.id
+        serial: dev?.serial || matchedDev?.serial || (device.id.includes(':') ? undefined : device.id),
+        physicalDeviceId: dev?.physicalDeviceId || matchedDev?.physicalDeviceId
       };
       deviceStore.updateDevice(device.id, patch);
-      broadcastDelta(device.id, patch);
+
+      // If matchedDev exists and is a different ID, merge immediately so the UI transitions seamlessly
+      if (matchedDev && matchedDev.id !== device.id) {
+        console.log(`[Tracker Add Dedupe] Immediate merge of ${matchedDev.id} into newly connected ${device.id}`);
+        const oldWorker = workers.get(matchedDev.id);
+        if (oldWorker) {
+          workerGenerations.set(matchedDev.id, (workerGenerations.get(matchedDev.id) || 0) + 1);
+          oldWorker.kill();
+          workers.delete(matchedDev.id);
+        }
+        closeLiveView(matchedDev.id, 'Connection transferred to new transport');
+
+        const merged = deviceStore.mergeDevices(device.id, matchedDev.id);
+        broadcastDelta(matchedDev.id, {}, true);
+        broadcastDelta(device.id, merged);
+      } else {
+        broadcastDelta(device.id, patch);
+      }
 
       if (device.type === 'device' || device.type === 'unauthorized') {
         queueWorker(device.id, device.type);
       }
     });
 
-    tracker.on('remove', (device: any) => {
+    tracker.on('remove', async (device: any) => {
       console.log('Device removed:', device.id);
-      if (deviceStore.hasDevice(device.id)) {
-        deviceStore.updateDevice(device.id, { status: 'offline' });
-        broadcastDelta(device.id, { status: 'offline' });
-      }
+      const dev = deviceStore.getDevice(device.id);
 
       const worker = workers.get(device.id);
       if (worker) {
@@ -237,6 +265,44 @@ async function startAdbTracker() {
         if (qIdx >= 0) workerQueue.splice(qIdx, 1);
       }
       closeLiveView(device.id, 'Connection lost — device disconnected');
+
+      // Check if another transport is still active for this physical device
+      // (e.g. Wi-Fi was disconnected, but USB cable is still plugged into computer)
+      try {
+        const activeAdbDevices = await client.listDevices();
+        let fallbackTransport: any = null;
+
+        if (dev) {
+          const physMapping = dev.physicalDeviceId ? deviceStore.getPhysicalMapping(dev.physicalDeviceId) : undefined;
+          for (const d of activeAdbDevices) {
+            if (d.id === device.id) continue;
+            const matchesSerial = dev.serial && (d.id === dev.serial || physMapping?.serials?.includes(d.id));
+            const matchesLastSeen = physMapping && physMapping.lastSeenTransportId === d.id;
+            if (matchesSerial || matchesLastSeen) {
+              fallbackTransport = d;
+              break;
+            }
+          }
+        }
+
+        if (fallbackTransport) {
+          console.log(`[Tracker Remove Dedupe] Active fallback transport ${fallbackTransport.id} detected for removed ${device.id}. Re-activating fallback transport.`);
+          const merged = deviceStore.mergeDevices(fallbackTransport.id, device.id);
+          broadcastDelta(device.id, {}, true);
+          broadcastDelta(fallbackTransport.id, merged);
+          if (fallbackTransport.type === 'device' || fallbackTransport.type === 'unauthorized') {
+            queueWorker(fallbackTransport.id, fallbackTransport.type);
+          }
+          return;
+        }
+      } catch (err) {
+        console.warn('[Tracker Remove] Fallback transport detection failed:', err);
+      }
+
+      if (deviceStore.hasDevice(device.id)) {
+        deviceStore.updateDevice(device.id, { status: 'offline' });
+        broadcastDelta(device.id, { status: 'offline' });
+      }
     });
 
     tracker.on('change', (device: any) => {
@@ -1094,8 +1160,9 @@ ipcMain.handle('switch-to-wireless', async (_event, deviceId) => {
       return { success: false, error: `Failed to connect to ${ip}:5555` };
     }
     
-    // Proactively dedupe the USB device's active processes NOW to prevent race conditions
+    // Proactively dedupe and merge the USB device into the new WiFi transport NOW
     const oldId = deviceId;
+    const newId = `${ip}:5555`;
     const oldWorker = workers.get(oldId);
     if (oldWorker) {
       workerGenerations.set(oldId, (workerGenerations.get(oldId) || 0) + 1);
@@ -1108,11 +1175,13 @@ ipcMain.handle('switch-to-wireless', async (_event, deviceId) => {
       activeLiveViews.delete(oldId);
     }
     if (deviceStore.hasDevice(oldId)) {
-      deviceStore.updateDevice(oldId, { lastKnownIp: ip, status: 'offline' });
-      broadcastDelta(oldId, { lastKnownIp: ip, status: 'offline' });
+      deviceStore.updateDevice(oldId, { lastKnownIp: ip });
+      const merged = deviceStore.mergeDevices(newId, oldId);
+      broadcastDelta(oldId, {}, true);
+      broadcastDelta(newId, merged);
     }
 
-    logAction(deviceId, `Switched to Wireless ADB (${ip}:5555)`);
+    logAction(newId, `Switched to Wireless ADB (${ip}:5555)`);
     return { success: true, ip };
   } catch (e: any) {
     return { success: false, error: e.message };
