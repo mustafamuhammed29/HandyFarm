@@ -1,5 +1,6 @@
 export interface DeviceData {
   id: string;
+  physicalDeviceId?: string;
   status: string; // 'device', 'offline', 'unauthorized', 'disconnect', etc.
   model?: string;
   manufacturer?: string;
@@ -78,6 +79,8 @@ declare global {
       parseApk: (filePath: string) => Promise<{success: boolean, path?: string, name?: string, size?: number, packageName?: string, error?: string}>;
       getInstalledPackages: (deviceId: string) => Promise<{success: boolean, packages?: string[], error?: string}>;
       retryDevice: (deviceId: string) => Promise<{ok: boolean}>;
+      getPhysicalDeviceMappings?: () => Promise<any[]>;
+      getPhysicalDeviceMapping?: (physicalDeviceId: string) => Promise<any>;
     };
   }
 }

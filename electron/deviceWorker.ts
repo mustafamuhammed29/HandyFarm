@@ -1,5 +1,6 @@
 import adbkit from '@devicefarmer/adbkit';
 import deviceDbPkg from 'stf-device-db';
+import { generatePhysicalDeviceId } from './identity.js';
 
 const Adb = (adbkit as any).Adb || (adbkit as any).default?.Adb || (adbkit as any).default || adbkit;
 const deviceDb = (deviceDbPkg as any).default || deviceDbPkg;
@@ -20,12 +21,26 @@ async function getShellProp(prop: string): Promise<string> {
   });
 }
 
+// Helper: run a shell command and return trimmed output
+async function getShellOutput(cmd: string): Promise<string> {
+  const stream = await client.getDevice(deviceId).shell(cmd);
+  const chunks: Buffer[] = [];
+  return new Promise((resolve) => {
+    stream.on('data', (c: Buffer) => chunks.push(c));
+    stream.on('end', () => resolve(Buffer.concat(chunks).toString().trim()));
+    stream.on('error', () => resolve(''));
+  });
+}
+
 async function updateDeviceData() {
   if (status !== 'device') {
-    // If not authorized or offline, we just send what we have
+    // If not authorized or offline, send minimal status without overwriting valid serials
     process.send?.({
       type: 'DEVICE_DATA',
-      data: { status, serial: deviceId }
+      data: {
+        status,
+        serial: deviceId.includes(':') ? undefined : deviceId
+      }
     });
     return;
   }
@@ -34,6 +49,9 @@ async function updateDeviceData() {
     let model = '';
     let manufacturer = '';
     let serial = '';
+    let bootSerial = '';
+    let productDevice = '';
+    let buildFingerprint = '';
 
     // --- Attempt 1: adbkit getProperties() with timing ---
     const t0 = Date.now();
@@ -46,9 +64,12 @@ async function updateDeviceData() {
       ]) as Record<string, string>;
       const elapsed = Date.now() - t0;
       console.log(`[Worker ${deviceId}] getProperties() succeeded in ${elapsed}ms`);
-      model        = properties['ro.product.model']        || '';
-      manufacturer = properties['ro.product.manufacturer'] || '';
-      serial       = properties['ro.serialno']             || '';
+      model            = properties['ro.product.model']        || '';
+      manufacturer     = properties['ro.product.manufacturer'] || '';
+      serial           = properties['ro.serialno']             || '';
+      bootSerial       = properties['ro.boot.serialno']        || '';
+      productDevice    = properties['ro.product.device']       || '';
+      buildFingerprint = properties['ro.build.fingerprint']    || '';
     } catch (propErr: any) {
       const elapsed = Date.now() - t0;
       console.warn(`[Worker ${deviceId}] getProperties() FAILED after ${elapsed}ms — error: ${propErr?.message || propErr}`);
@@ -56,12 +77,15 @@ async function updateDeviceData() {
 
       // --- Attempt 2: individual shell getprop calls ---
       try {
-        [model, manufacturer, serial] = await Promise.all([
+        [model, manufacturer, serial, bootSerial, productDevice, buildFingerprint] = await Promise.all([
           getShellProp('ro.product.model'),
           getShellProp('ro.product.manufacturer'),
           getShellProp('ro.serialno'),
+          getShellProp('ro.boot.serialno'),
+          getShellProp('ro.product.device'),
+          getShellProp('ro.build.fingerprint'),
         ]);
-        console.log(`[Worker ${deviceId}] Shell fallback succeeded: model=${model}, manufacturer=${manufacturer}, serial=${serial}`);
+        console.log(`[Worker ${deviceId}] Shell fallback succeeded: model=${model}, manufacturer=${manufacturer}, serial=${serial}, bootSerial=${bootSerial}`);
       } catch (shellErr: any) {
         console.error(`[Worker ${deviceId}] Shell fallback also FAILED: ${shellErr?.message || shellErr}`);
       }
@@ -70,7 +94,29 @@ async function updateDeviceData() {
     // Final fallbacks
     model        = model        || 'Unknown';
     manufacturer = manufacturer || 'Unknown';
-    serial       = serial       || deviceId;
+    serial       = serial       || (deviceId.includes(':') ? '' : deviceId);
+
+    // Compute stable hardware physicalDeviceId
+    const physicalDeviceId = generatePhysicalDeviceId({
+      bootSerial,
+      serial: serial || undefined,
+      productDevice,
+      buildFingerprint,
+    });
+
+    // Detect IP address
+    let lastKnownIp: string | undefined = undefined;
+    if (deviceId.includes(':')) {
+      lastKnownIp = deviceId.split(':')[0];
+    } else {
+      try {
+        const routeOut = await getShellOutput('ip route');
+        const m = routeOut.match(/src\s+(\d+\.\d+\.\d+\.\d+)/);
+        if (m && m[1]) {
+          lastKnownIp = m[1];
+        }
+      } catch {}
+    }
 
     let deviceName = model;
     // Use stf-device-db if possible
@@ -83,16 +129,17 @@ async function updateDeviceData() {
       console.error('Failed to lookup device in stf-device-db', e);
     }
 
-    console.log(`[Worker ${deviceId}] Sending DEVICE_DATA: model=${model}, serial=${serial}, status=${status}`);
+    console.log(`[Worker ${deviceId}] Sending DEVICE_DATA: model=${model}, serial=${serial}, physicalId=${physicalDeviceId}, status=${status}`);
     process.send?.({
       type: 'DEVICE_DATA',
       data: {
         status,
         model,
         manufacturer,
-        serial,
+        serial: serial || undefined,
+        physicalDeviceId,
+        lastKnownIp,
         name: deviceName,
-        customName: undefined,
       }
     });
 

@@ -37,6 +37,7 @@ const workers: Map<string, ChildProcess> = new Map();
 const workerGenerations: Map<string, number> = new Map();
 
 import { DeviceStore, thumbnailCache, downscaleThumbnail, type DeviceData } from './db.js';
+export { DeviceStore, thumbnailCache, downscaleThumbnail };
 
 const sqliteDbPath = path.join(app.getPath('userData'), 'handyfarm.db');
 const legacyJsonPath = path.join(app.getPath('userData'), 'devices.json');
@@ -52,35 +53,55 @@ function broadcastDelta(deviceId: string, patch: Partial<DeviceData>, removed = 
   }
 }
 
-// Run dedupe once on startup to clean up any duplicates in the database
+// Run dedupe once on startup to clean up and merge any duplicates in the database
 const allInitialDevices = deviceStore.getAllDevices(false);
 for (let i = 0; i < allInitialDevices.length; i++) {
   const d1 = allInitialDevices[i];
-  if (!d1 || !d1.serial) continue;
+  if (!d1) continue;
   for (let j = i + 1; j < allInitialDevices.length; j++) {
     const d2 = allInitialDevices[j];
-    if (!d2 || !d2.serial) continue;
+    if (!d2) continue;
 
-    if (d1.serial === d2.serial) {
-      console.log(`[Startup Dedupe] Found duplicate serial ${d1.serial} for ${d1.id} and ${d2.id}`);
+    const isMatch = (
+      (d1.physicalDeviceId && d2.physicalDeviceId && d1.physicalDeviceId === d2.physicalDeviceId) ||
+      (d1.serial && d2.serial && d1.serial === d2.serial) ||
+      (d1.serial && d1.serial === d2.id) ||
+      (d2.serial && d2.serial === d1.id)
+    );
+
+    if (isMatch) {
+      console.log(`[Startup Dedupe] Found duplicate for ${d1.id} (serial: ${d1.serial}, phys: ${d1.physicalDeviceId}) and ${d2.id} (serial: ${d2.serial}, phys: ${d2.physicalDeviceId})`);
       const d1IsWifi = d1.id.includes(':');
       const d2IsWifi = d2.id.includes(':');
 
       const d1IsActive = d1.status === 'device';
       const d2IsActive = d2.status === 'device';
 
-      let toRemove = null;
-      if (d1IsActive && !d2IsActive) toRemove = d2.id;
-      else if (!d1IsActive && d2IsActive) toRemove = d1.id;
-      else {
-        // Prefer USB: if one is WiFi and the other is USB, remove the WiFi one.
-        if (d1IsWifi && !d2IsWifi) toRemove = d1.id;
-        else if (!d1IsWifi && d2IsWifi) toRemove = d2.id;
-        else toRemove = d2.id;
+      let survivingId: string;
+      let losingId: string;
+
+      if (d1IsActive && !d2IsActive) {
+        survivingId = d1.id;
+        losingId = d2.id;
+      } else if (!d1IsActive && d2IsActive) {
+        survivingId = d2.id;
+        losingId = d1.id;
+      } else {
+        // Prefer USB (hardware serial) if both active or both inactive
+        if (d1IsWifi && !d2IsWifi) {
+          survivingId = d2.id;
+          losingId = d1.id;
+        } else if (!d1IsWifi && d2IsWifi) {
+          survivingId = d1.id;
+          losingId = d2.id;
+        } else {
+          survivingId = d1.id;
+          losingId = d2.id;
+        }
       }
 
-      console.log(`[Startup Dedupe] Evicting stale entry ${toRemove}`);
-      deviceStore.deleteDevice(toRemove);
+      console.log(`[Startup Dedupe] Merging duplicate entry ${losingId} into surviving entry ${survivingId}`);
+      deviceStore.mergeDevices(survivingId, losingId);
     }
   }
 }
@@ -359,56 +380,76 @@ function spawnWorker(deviceId: string, status: string) {
 
       deviceStore.updateDevice(deviceId, patch);
 
-      if (patch.serial) {
-        const allDevs = deviceStore.getAllDevices(false);
-        for (const other of allDevs) {
-          if (other.id !== deviceId && other.serial === patch.serial) {
-            console.log(`[Dedupe check] Conflict found between ${deviceId} and ${other.id} (serial: ${patch.serial})`);
+      let hasMerged = false;
+      const allDevs = deviceStore.getAllDevices(false);
+      for (const other of allDevs) {
+        if (other.id === deviceId) continue;
 
-            // Only conflict if they are both trying to be active, or prefer the active one
-            const isCurrentWifi = deviceId.includes(':');
-            const isOtherWifi = other.id.includes(':');
+        const isMatch = (
+          (patch.physicalDeviceId && other.physicalDeviceId && patch.physicalDeviceId === other.physicalDeviceId) ||
+          (patch.serial && other.serial && patch.serial === other.serial) ||
+          (patch.serial && patch.serial === other.id) ||
+          (other.serial && other.serial === deviceId)
+        );
 
-            const isCurrentActive = patch.status === 'device';
-            const isOtherActive = other.status === 'device';
+        if (isMatch) {
+          console.log(`[Dedupe check] Physical device conflict found between ${deviceId} and ${other.id} (serial: ${patch.serial || other.serial}, physId: ${patch.physicalDeviceId || other.physicalDeviceId})`);
 
-            let idToKill = null;
-            if (isCurrentActive && !isOtherActive) {
-              idToKill = other.id;
-            } else if (!isCurrentActive && isOtherActive) {
+          const isCurrentWifi = deviceId.includes(':');
+          const isOtherWifi = other.id.includes(':');
+
+          const isCurrentActive = patch.status === 'device';
+          const isOtherActive = other.status === 'device';
+
+          let idToKill: string;
+          let survivingId: string;
+
+          if (isCurrentActive && !isOtherActive) {
+            // Current connection is active, other is inactive -> current survives
+            survivingId = deviceId;
+            idToKill = other.id;
+          } else if (!isCurrentActive && isOtherActive) {
+            // Other connection is active, current is inactive -> other survives
+            survivingId = other.id;
+            idToKill = deviceId;
+          } else if (isCurrentActive && isOtherActive) {
+            // Both are active: newly reporting connection takes over as the active transport
+            survivingId = deviceId;
+            idToKill = other.id;
+          } else {
+            // Both are inactive: keep hardware serial (non-WiFi) if possible
+            if (isCurrentWifi && !isOtherWifi) {
+              survivingId = other.id;
               idToKill = deviceId;
             } else {
-              // Prefer USB connection if both are active or both inactive
-              if (isCurrentWifi && !isOtherWifi) {
-                idToKill = deviceId; // kill the current WiFi if other is USB
-              } else if (!isCurrentWifi && isOtherWifi) {
-                idToKill = other.id; // kill the other WiFi if current is USB
-              } else {
-                idToKill = other.id;
-              }
+              survivingId = deviceId;
+              idToKill = other.id;
             }
+          }
 
-            if (idToKill) {
-              console.log(`[Dedupe] MATCH! Evicting stale/duplicate device ${idToKill} to enforce one tile per physical device`);
-              const oldWorker = workers.get(idToKill);
-              if (oldWorker) {
-                workerGenerations.set(idToKill, (workerGenerations.get(idToKill) || 0) + 1);
-                oldWorker.kill();
-                workers.delete(idToKill);
-              }
-              closeLiveView(idToKill, 'Connection lost — evicted by dedupe logic');
-              deviceStore.deleteDevice(idToKill);
-              broadcastDelta(idToKill, {}, true);
+          console.log(`[Dedupe] MERGING! Consolidating duplicate ${idToKill} into surviving ${survivingId}`);
+          const oldWorker = workers.get(idToKill);
+          if (oldWorker) {
+            workerGenerations.set(idToKill, (workerGenerations.get(idToKill) || 0) + 1);
+            oldWorker.kill();
+            workers.delete(idToKill);
+          }
+          closeLiveView(idToKill, 'Connection transferred to surviving transport');
 
-              if (idToKill === deviceId) {
-                return; // Stop processing this worker's message
-              }
-            }
+          const merged = deviceStore.mergeDevices(survivingId, idToKill);
+          broadcastDelta(idToKill, {}, true);
+          broadcastDelta(survivingId, merged);
+          hasMerged = true;
+
+          if (idToKill === deviceId) {
+            return; // Stop processing this worker's message since it was merged into other
           }
         }
       }
 
-      broadcastDelta(deviceId, patch);
+      if (!hasMerged) {
+        broadcastDelta(deviceId, patch);
+      }
     }
   });
 
@@ -1354,3 +1395,12 @@ ipcMain.handle('get-installed-packages', async (_event, deviceId: string) => {
     return { success: false, error: e.message };
   }
 });
+
+ipcMain.handle('get-physical-device-mappings', async () => {
+  return deviceStore.getAllPhysicalMappings();
+});
+
+ipcMain.handle('get-physical-device-mapping', async (_event, physicalDeviceId: string) => {
+  return deviceStore.getPhysicalMapping(physicalDeviceId);
+});
+

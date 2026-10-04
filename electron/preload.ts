@@ -49,6 +49,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   parseApk: (filePath: string) => ipcRenderer.invoke('parse-apk', filePath),
   getInstalledPackages: (deviceId: string) => ipcRenderer.invoke('get-installed-packages', deviceId),
   retryDevice: (deviceId: string) => ipcRenderer.invoke('retry-device', deviceId),
+  getPhysicalDeviceMappings: () => ipcRenderer.invoke('get-physical-device-mappings'),
+  getPhysicalDeviceMapping: (physicalDeviceId: string) => ipcRenderer.invoke('get-physical-device-mapping', physicalDeviceId),
 });
 
 
