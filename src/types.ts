@@ -59,7 +59,7 @@ declare global {
       installApk: (deviceId: string, apkPath: string, sessionId?: string) => Promise<{success: boolean, error?: string}>;
       updateDeviceData: (deviceId: string, data: Partial<DeviceData>) => Promise<boolean>;
       onDevicesUpdated: (callback: (update: DeviceData[] | DeviceDelta) => void) => void;
-      switchToWireless: (deviceId: string) => Promise<{success: boolean, ip?: string, error?: string}>;
+      switchToWireless: (deviceId: string, sessionId?: string) => Promise<{success: boolean, ip?: string, error?: string}>;
       // Phase 7 Actions
       exportConfig: () => Promise<{success: boolean, path?: string, error?: string}>;
       importConfig: () => Promise<{success: boolean, error?: string}>;
@@ -68,7 +68,7 @@ declare global {
       toggleScreen: (deviceId: string) => Promise<{success: boolean, error?: string}>;
       takeScreenshot: (deviceId: string) => Promise<{success: boolean, path?: string, error?: string}>;
       
-      syncClipboard: (deviceId: string, direction: 'toDevice' | 'fromDevice', text?: string) => Promise<{success: boolean, text?: string, error?: string}>;
+      syncClipboard: (deviceId: string, direction: 'toDevice' | 'fromDevice', text?: string, sessionId?: string) => Promise<{success: boolean, text?: string, error?: string}>;
       sendText: (deviceId: string, text: string, sessionId?: string) => Promise<{success: boolean, error?: string}>;
       pushFile: (deviceId: string, localPath: string, remotePath: string, sessionId?: string) => Promise<{success: boolean, error?: string}>;
       pullFile: (deviceId: string, remotePath: string, localPath: string) => Promise<{success: boolean, error?: string}>;

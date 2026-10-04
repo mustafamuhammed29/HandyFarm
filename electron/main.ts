@@ -81,7 +81,20 @@ export function checkDeviceLeaseGuard(deviceId: string, sessionId?: string): { a
     const now = Date.now();
     if (lease.leaseExpiresAt && lease.leaseExpiresAt <= now) {
       // Lease TTL expired without renewal -> auto-release
-      deviceStore.sweepExpiredLeases();
+      const { changedLeases, affectedDeviceIds } = deviceStore.sweepExpiredLeases();
+      if (changedLeases.length > 0) {
+        for (const id of affectedDeviceIds) {
+          const dev = deviceStore.getDevice(id);
+          if (dev) {
+            broadcastDelta(id, {
+              leaseState: dev.leaseState,
+              leasedBy: dev.leasedBy ?? (null as any),
+              leaseExpiresAt: dev.leaseExpiresAt ?? (null as any),
+              lastHeartbeatAt: dev.lastHeartbeatAt ?? (null as any)
+            });
+          }
+        }
+      }
       return { allowed: true };
     }
     if (!sessionId || sessionId !== lease.leasedBy) {
@@ -98,6 +111,7 @@ setInterval(() => {
   try {
     const { changedLeases, affectedDeviceIds } = deviceStore.sweepExpiredLeases();
     if (changedLeases.length > 0) {
+      console.log(`[Lease Sweep] State changed for ${changedLeases.length} lease(s). Emitting delta broadcast for: ${affectedDeviceIds.join(', ')}`);
       for (const id of affectedDeviceIds) {
         const dev = deviceStore.getDevice(id);
         if (dev) {
@@ -1171,7 +1185,11 @@ async function ensureClipperInstalled(deviceId: string) {
   }
 }
 
-ipcMain.handle('sync-clipboard', async (_event, deviceId, direction, text) => {
+ipcMain.handle('sync-clipboard', async (_event, deviceId, direction, text, sessionId?: string) => {
+  const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
+  if (!leaseGuard.allowed) {
+    return { success: false, error: leaseGuard.error };
+  }
   try {
     await ensureClipperInstalled(deviceId);
     if (direction === 'toDevice') {
@@ -1210,7 +1228,11 @@ ipcMain.handle('sync-clipboard', async (_event, deviceId, direction, text) => {
   }
 });
 
-ipcMain.handle('switch-to-wireless', async (_event, deviceId) => {
+ipcMain.handle('switch-to-wireless', async (_event, deviceId, sessionId?: string) => {
+  const leaseGuard = checkDeviceLeaseGuard(deviceId, sessionId);
+  if (!leaseGuard.allowed) {
+    return { success: false, error: leaseGuard.error };
+  }
   try {
     // 1. Restart ADB in TCP/IP mode on port 5555
     await execAsync(`adb -s ${deviceId} tcpip 5555`);

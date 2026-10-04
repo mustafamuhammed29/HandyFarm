@@ -10,7 +10,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.removeAllListeners('devices-updated');
     ipcRenderer.on('devices-updated', (_event, devices) => callback(devices));
   },
-  switchToWireless: (deviceId: string) => ipcRenderer.invoke('switch-to-wireless', deviceId),
+  switchToWireless: (deviceId: string, sessionId?: string) => ipcRenderer.invoke('switch-to-wireless', deviceId, sessionId),
   
   // Phase 7 Actions
   exportConfig: () => ipcRenderer.invoke('export-config'),
@@ -18,7 +18,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   checkAdbStatus: () => ipcRenderer.invoke('check-adb-status'),
   toggleScreen: (deviceId: string) => ipcRenderer.invoke('toggle-screen', deviceId),
   takeScreenshot: (deviceId: string) => ipcRenderer.invoke('take-screenshot', deviceId),
-  syncClipboard: (deviceId: string, direction: string, text?: string) => ipcRenderer.invoke('sync-clipboard', deviceId, direction, text),
+  syncClipboard: (deviceId: string, direction: string, text?: string, sessionId?: string) => ipcRenderer.invoke('sync-clipboard', deviceId, direction, text, sessionId),
   sendText: (deviceId: string, text: string, sessionId?: string) => ipcRenderer.invoke('send-text', deviceId, text, sessionId),
   pushFile: (deviceId: string, localPath: string, remotePath: string, sessionId?: string) => ipcRenderer.invoke('push-file', deviceId, localPath, remotePath, sessionId),
   pullFile: (deviceId: string, remotePath: string, localPath: string) => ipcRenderer.invoke('pull-file', deviceId, remotePath, localPath),

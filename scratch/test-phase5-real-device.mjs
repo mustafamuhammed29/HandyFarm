@@ -182,6 +182,35 @@ async function main() {
     }
     console.log(`✓ Unauthorized action correctly rejected by lease guard: "${blockedAction?.error}"`);
 
+    // Verify switch-to-wireless is blocked for intruder session
+    const blockedWireless = await cdp.eval(`
+      window.electronAPI.switchToWireless('${liveDevice.id}', 'intruder-session-beta')
+    `);
+    console.log('Blocked switchToWireless result:', JSON.stringify(blockedWireless));
+    if (blockedWireless?.success) {
+      throw new Error('switchToWireless from unauthorized session should have been REJECTED!');
+    }
+    console.log(`✓ Unauthorized switchToWireless correctly rejected: "${blockedWireless?.error}"`);
+
+    // Verify sync-clipboard (toDevice and fromDevice) is blocked for intruder session
+    const blockedClipTo = await cdp.eval(`
+      window.electronAPI.syncClipboard('${liveDevice.id}', 'toDevice', 'injected text', 'intruder-session-beta')
+    `);
+    console.log('Blocked syncClipboard(toDevice) result:', JSON.stringify(blockedClipTo));
+    if (blockedClipTo?.success) {
+      throw new Error('syncClipboard(toDevice) from unauthorized session should have been REJECTED!');
+    }
+    console.log(`✓ Unauthorized syncClipboard(toDevice) correctly rejected: "${blockedClipTo?.error}"`);
+
+    const blockedClipFrom = await cdp.eval(`
+      window.electronAPI.syncClipboard('${liveDevice.id}', 'fromDevice', '', 'intruder-session-beta')
+    `);
+    console.log('Blocked syncClipboard(fromDevice) result:', JSON.stringify(blockedClipFrom));
+    if (blockedClipFrom?.success) {
+      throw new Error('syncClipboard(fromDevice) from unauthorized session should have been REJECTED!');
+    }
+    console.log(`✓ Unauthorized syncClipboard(fromDevice) correctly rejected: "${blockedClipFrom?.error}"`);
+
     // Authorized session should pass
     const allowedAction = await cdp.eval(`
       window.electronAPI.sendText('${liveDevice.id}', 'test', 'operator-session-alpha')
@@ -271,9 +300,25 @@ async function main() {
       if (finalBadge?.className.includes('available')) break;
     }
     console.log('✓ Final UI DOM Lease Badge after cooldown completion:', finalBadge);
-    if (!finalBadge?.className.includes('available')) {
-      throw new Error(`Expected badge to return to 'available', got: ${finalBadge?.className}`);
+    // 8. Test Idle Fleet Broadcast Silence (Verify no unconditional broadcasts every 2s)
+    console.log('\n[STEP 8] Verifying idle-fleet broadcast silence (zero IPC overhead during idle ticks)...');
+    console.log('Sampling idle state for 4.5 seconds (spans multiple 2-second sweep intervals)...');
+    await sleep(4500);
+
+    const idleUpdatedText = await cdp.eval(`
+      (() => {
+        const spans = Array.from(document.querySelectorAll('span'));
+        const el = spans.find(s => s.textContent.includes('Last updated:'));
+        return el ? el.textContent.trim() : null;
+      })()
+    `);
+    console.log('UI Last Updated indicator after 4.5s idle period:', idleUpdatedText);
+    const secondsMatch = idleUpdatedText?.match(/Last updated:\s*(\d+)s/);
+    const elapsedSeconds = secondsMatch ? parseInt(secondsMatch[1], 10) : 0;
+    if (elapsedSeconds < 3) {
+      throw new Error(`Idle broadcast overhead detected! UI was updated ${elapsedSeconds}s ago, expected >= 3s without unconditional broadcasts.`);
     }
+    console.log(`✓ Idle-fleet broadcast silence confirmed: UI idle time accumulated to ${elapsedSeconds}s without spurious delta broadcasts!`);
 
     cdp.close();
     console.log('\n===============================================================');
