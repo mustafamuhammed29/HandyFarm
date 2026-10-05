@@ -243,7 +243,7 @@ once to unstop the package." (Not a bug — just an untested surface.)
    handyfarm release --device <id> --force" link in the lease error toast would close the loop.
 
 4. **`logcat` viewer still works but only after `spawn` was added.** This was fixed in commit
-   `0cd080d` (Phase 2 dual-transport bugfix), so the `import { spawn }` is in place now. No
+   `307a320` (Phase 2 dual-transport bugfix), so the `import { spawn }` is in place now. No
    regression in the live pass.
 
 5. **The `sendText` IPC isn't exposed via REST.** Only via the renderer IPC. The CLI doesn't have
@@ -264,3 +264,13 @@ once to unstop the package." (Not a bug — just an untested surface.)
 8. **The two-phase "send text via placeholder substitution" feature (`{serial}` / `{model}`) works
    in the renderer but not in the REST API.** A batch API that took a target set + a text + a flag
    `placeholderSubstitute: true` would round out the API for automation without a renderer.
+
+## Security Audit: Resolution of Commit 0cd080d Disclosure
+
+Commit `0cd080d` (`0cd080d41dfd26bffbe845765701e7adb679290f`) was flagged in prior commit notes as a potential exposed blob reachable via `raw.githubusercontent.com`.
+
+A comprehensive investigation of the raw commit object and GitHub API was conducted:
+- **Commit Details**: Title `fix(phase-2): dual-transport check no longer infers cellular from settings flags alone`, authored on 2026-10-04T14:54:28Z.
+- **Files Modified**: Exactly 3 files: `electron/apiServer.ts` (query parser fix), `electron/network.ts` (handling `transport === 'unknown'`), and `tests/network-preflight.test.ts` (regression tests for `NO_ACTIVE_NETWORK`).
+- **Secret Content**: Zero. The commit contains no API keys, tokens, credentials, private keys, or passwords. It was simply the pre-filter duplicate of commit `307a320b872e89ef20ce7142674d4ea90b831a0c` prior to history cleanup in commit `f35c7e7`.
+- **Verdict**: Confirmed inert. No secret rotation is required because no sensitive material exists in the blob. The disclosure line is permanently closed.
