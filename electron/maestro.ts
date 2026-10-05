@@ -1,15 +1,13 @@
 // Phase 5: Maestro CLI executor.
 //
-// This is the production path. It calls `maestro` via execFile, streams
+// This is the production path. It calls `maestro` via execFile/spawn, streams
 // stdout/stderr, captures artifacts, and reports pass/fail with the lease
 // properly held for the run's duration.
 //
-// `maestro` is not bundled — install it locally with one of:
-//   - npm i -g @mobile-dev-inc/maestro-cli
-//   - brew install maestro
-//   - scoop install maestro   (Windows)
+// `maestro` is installed locally via Eclipse Temurin 21 JDK + Maestro CLI
+// binary (detected via `probeMaestro()`).
 //
-// When `maestro` is not on PATH, every entry point returns a structured
+// When `maestro` is not on PATH, entry points return a structured
 // `MAESTRO_NOT_FOUND` error. The mini-flow runner in miniFlow.ts is the
 // offline-staging alternative that uses our existing adb machinery.
 
@@ -213,7 +211,7 @@ export async function runMaestroFlow(spec: MaestroRunSpec, adbSerial: string): P
     let stderr = '';
     let killed = false;
 
-    const child = spawn(probe.path, ['-d', adbSerial, 'test', resolvedFlowPath!], {
+    const child = spawn(probe.path, ['test', '--device', adbSerial, resolvedFlowPath!], {
       env: { ...process.env, ...(spec.env || {}) },
     });
 

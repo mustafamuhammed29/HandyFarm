@@ -62,22 +62,19 @@ describe.skipIf(!ENABLED)('Phase 5 live demo — regression + diff + crash on re
     if (ctx) cleanup(ctx);
   });
 
-  it('Step 1: regression run via mini-flow — launch Settings, screenshot, keyevent HOME', async () => {
+  it('Step 1: regression run via maestro — launch Settings, screenshot, back', async () => {
     ctx.store.savePhysicalDeviceHealth({
       physicalDeviceId: ctx.physId, healthScore: 100, healthReasons: [], healthLastEvaluatedAt: 0,
     });
 
     const result = await runRegressionWithLease(ctx.store, ctx.scheduler, {
-      runner: 'miniflow',
+      runner: 'maestro',
       flow: {
-        flowContent: `
-# Phase 5 demo: launch Settings, screenshot, sleep, dismiss.
-- launchApp: com.android.settings
-- sleep: 1500
-- takeScreenshot: settings-1.png
-- sleep: 500
-- keyevent: KEYCODE_HOME
-- sleep: 500
+        flowContent: `appId: com.android.settings
+---
+- launchApp
+- takeScreenshot: settings-1
+- back
 `,
         substitutions: {},
       },
@@ -89,14 +86,14 @@ describe.skipIf(!ENABLED)('Phase 5 live demo — regression + diff + crash on re
 
     console.log(`[Demo 1] status=${result.status}`);
     console.log(`[Demo 1] summary=${result.summary}`);
-    if (result.miniflow) {
-      console.log(`[Demo 1] steps:`);
-      for (const s of result.miniflow.steps) {
-        console.log(`         ${s.index}. ${s.verb} (${s.status}, ${s.durationMs}ms)${s.output ? ' → ' + s.output : ''}`);
-      }
+    if (result.maestro) {
+      console.log(`[Demo 1] stdout:\n${result.maestro.stdout}`);
+      console.log(`[Demo 1] duration=${result.maestro.durationMs}ms`);
     }
     expect(result.status).toBe('passed');
-    expect(result.miniflow?.steps.some(s => s.verb === 'takeScreenshot' && s.status === 'passed')).toBe(true);
+    expect(result.runner).toBe('maestro');
+    expect(result.maestro).toBeDefined();
+    expect(result.maestro?.exitCode).toBe(0);
     // Lease released.
     expect(ctx.store.getLease(ctx.physId).state).not.toBe('leased');
   }, 60_000);
