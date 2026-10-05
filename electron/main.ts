@@ -1207,13 +1207,20 @@ async function openUrlRobust(deviceId: string, url: string) {
 
 ipcMain.handle('open-link', async (_event, deviceId, url) => {
   try {
+    let trimmed = (url || '').trim();
+    if (!trimmed) {
+      return { success: false, error: 'URL cannot be empty' };
+    }
+    if (!/^https?:\/\//i.test(trimmed) && !trimmed.startsWith('data:text/html')) {
+      trimmed = 'https://' + trimmed;
+    }
     let parsed: URL;
     try {
-      parsed = new URL(url);
+      parsed = new URL(trimmed);
     } catch {
       return { success: false, error: 'Invalid URL format' };
     }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:' && !trimmed.startsWith('data:text/html')) {
       return { success: false, error: 'Only http: and https: protocols are allowed' };
     }
     await openUrlRobust(deviceId, parsed.toString());

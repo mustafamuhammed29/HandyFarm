@@ -435,7 +435,11 @@ useEffect(() => {
     if (e && e.altKey && focusedDeviceId) {
       targetIds = [focusedDeviceId];
     } else if (targetIds.length === 0) {
-      return;
+      targetIds = visibleDevices.filter(d => d.status === 'device').map(d => d.id);
+      if (targetIds.length === 0) {
+        setResults([{ deviceId: 'all', success: false, error: 'No connected devices available to perform action', action }]);
+        return;
+      }
     }
 
     if (action === 'reboot' && !e?.altKey) {
