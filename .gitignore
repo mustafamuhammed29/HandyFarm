@@ -40,6 +40,8 @@ scratch/test-wg-server.json
 scratch/test-local-wg-client.json
 scratch/wg-client.conf
 scratch/.oldkey-probe*.json
+scratch/*.jar
+scratch/*.zip
 # Generic key/cert material anywhere in the tree
 *.key
 *.pem
