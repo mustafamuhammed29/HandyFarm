@@ -1190,29 +1190,14 @@ async function openUrlRobust(deviceId: string, url: string) {
     throw new Error('Disallowed URL scheme. Only http, https, and data:text/html are supported.');
   }
 
-  let target = '';
-  try {
-    const resolveArgs = ['-s', deviceId, 'shell', 'pm', 'resolve-activity', '-a', 'android.intent.action.VIEW', '-d', url];
-    console.log(`[openUrlRobust] Resolving activity for ${deviceId}`);
-    const { stdout } = await execFileAsync('adb', resolveArgs);
-    
-    // Look for something like "com.android.chrome/com.google.android.apps.chrome.Main"
-    // that indicates a resolved component
-    const match = stdout.match(/([a-zA-Z0-9_.]+\/[a-zA-Z0-9_.]+)/);
-    if (match && !stdout.includes('No activity found')) {
-      target = match[1];
-    }
-  } catch (e: any) {
-    console.warn(`[openUrlRobust] Failed to resolve activity for ${deviceId}: ${e.message}`);
-  }
-
-  const startArgs = target 
-    ? ['-s', deviceId, 'shell', 'am', 'start', '-a', 'android.intent.action.VIEW', '-d', url, target]
-    : ['-s', deviceId, 'shell', 'am', 'start', '-a', 'android.intent.action.VIEW', '-d', url];
+  const startArgs = ['-s', deviceId, 'shell', 'am', 'start', '-a', 'android.intent.action.VIEW', '-d', url];
     
   console.log(`[openUrlRobust] Executing am start for ${deviceId}`);
   try {
     const { stdout, stderr } = await execFileAsync('adb', startArgs);
+    if (stdout.includes('Error:') || stdout.includes('Error type')) {
+      throw new Error(stdout.trim());
+    }
     console.log(`[openUrlRobust] Success: ${stdout} ${stderr}`);
   } catch (e: any) {
     console.error(`[openUrlRobust] Start failed. Exit code: ${e.code}, Stderr: ${e.stderr}, Error: ${e.message}`);
