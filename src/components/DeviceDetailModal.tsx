@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
-  X, MonitorSmartphone, FileText, ClipboardCheck, RefreshCw, Heart,
+  X, MonitorSmartphone, FileText, ClipboardCheck, RefreshCw, Heart, PackageSearch,
 } from 'lucide-react';
 import type { DeviceData } from '../types';
 import {
@@ -13,7 +13,7 @@ import {
 } from '../stateColor';
 import type { DeviceConnectionStatus, LeaseState } from '../stateColor';
 
-type Tab = 'screen' | 'apps' | 'health' | 'audit' | 'regression';
+type Tab = 'screen' | 'apps' | 'health' | 'audit' | 'regression' | 'agent';
 
 export interface DeviceDetailHealth {
   healthScore: number;
@@ -139,6 +139,7 @@ export const DeviceDetailModal: React.FC<DeviceDetailModalProps> = ({
             ['health', Heart, 'Health'],
             ['audit', FileText, 'Audit'],
             ['regression', RefreshCw, 'Regression'],
+            ['agent', PackageSearch, 'Agent'],
           ] as const).map(([k, Icon, label]) => (
             <button
               key={k}
@@ -177,6 +178,7 @@ export const DeviceDetailModal: React.FC<DeviceDetailModalProps> = ({
           {tab === 'apps' && <AppsTab device={device} />}
           {tab === 'health' && <HealthTab health={health} tier={tier} color={healthColor} />}
           {tab === 'audit' && <AuditTab rows={recentAudit || []} />}
+          {tab === 'agent' && <AgentTab device={device} />}
           {tab === 'regression' && <RegressionTab rows={recentRegression || []} />}
         </div>
       </div>
@@ -403,5 +405,197 @@ const Stat: React.FC<{ label: string; value: number | string }> = ({ label, valu
     <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>{label}</span>
   </div>
 );
+
+// ----- AgentTab -----
+//
+// Read-only host-side agent capability. The companion APK's status and the
+// device's installed-app inventory come back over `dumpsys package` and
+// `pm list packages -f`. No new APK build, no permission expansion.
+//
+// The tab is honest about what the host can see without a richer on-device
+// agent: package metadata, signatures, runtime-permission grants, and
+// inventory. There is no claim of broad app-data scraping.
+
+const AgentTab: React.FC<{ device: DeviceData }> = ({ device }) => {
+  const [status, setStatus] = useState<{ ok: boolean; status?: any; error?: string } | null>(null);
+  const [apps, setApps] = useState<{ ok: boolean; apps: any[]; error?: string } | null>(null);
+  const [filter, setFilter] = useState('');
+  const [perms, setPerms] = useState<{ ok: boolean; permissions: any[]; error?: string } | null>(null);
+  const [pickerMsg, setPickerMsg] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const TARGET_PKG = 'com.handyfarm.clipper';
+
+  const refresh = async () => {
+    if (!device?.id) return;
+    setBusy(true);
+    try {
+      const api = window.electronAPI;
+      const [s, a] = await Promise.all([
+        api.getAgentStatus ? api.getAgentStatus(device.id, TARGET_PKG) : Promise.resolve({ ok: false, error: 'unsupported' }),
+        api.getInstalledApps ? api.getInstalledApps(device.id) : Promise.resolve({ ok: false, apps: [], error: 'unsupported' }),
+      ]);
+      setStatus(s as any);
+      setApps(a as any);
+      const p = api.getGrantedPermissions
+        ? await api.getGrantedPermissions(device.id, TARGET_PKG)
+        : { ok: false, permissions: [], error: 'unsupported' };
+      setPerms(p as any);
+    } catch (err: any) {
+      setStatus({ ok: false, error: err?.message || String(err) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => { refresh(); /* re-fetch when device changes */ }, [device?.id]);
+
+  const filteredApps = useMemo(() => {
+    if (!apps?.apps) return [];
+    const q = filter.toLowerCase().trim();
+    if (!q) return apps.apps;
+    return apps.apps.filter((a: any) => a.package.toLowerCase().includes(q));
+  }, [apps, filter]);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+        Agent status is read via <code>adb shell dumpsys package</code>. No
+        new on-device agent is installed; this tab is honest about what
+        the host can see. For richer capabilities (per-app settings, media
+        picker, motion photos), see{' '}
+        <code>ANDROID-AGENT-SPEC.md</code>.
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <button
+          className="secondary-btn"
+          onClick={refresh}
+          disabled={busy}
+          style={{ padding: '4px 10px', fontSize: '12px' }}
+          data-testid="agent-refresh"
+        >
+          {busy ? 'Loading…' : 'Refresh'}
+        </button>
+        {status?.ok && (
+          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+            Companion {status.status?.versionName ? `v${status.status.versionName} (code ${status.status.versionCode})` : 'not installed'}
+            {status.status?.signatureSha256?.length > 0 && (
+              <> · sig <code>{status.status.signatureSha256[0]}</code></>
+            )}
+          </span>
+        )}
+        {status?.error && (
+          <span style={{ fontSize: '11px', color: 'var(--status-error)' }}>{status.error}</span>
+        )}
+      </div>
+
+      {/* Permissions */}
+      {perms?.ok && (
+        <div>
+          <h4 style={{ margin: '4px 0', fontSize: '13px' }}>Granted runtime permissions ({perms.permissions.length})</h4>
+          {perms.permissions.length === 0 ? (
+            <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>None declared.</div>
+          ) : (
+            <ul style={{ margin: 0, paddingLeft: '20px', fontSize: '12px' }}>
+              {perms.permissions.map((p: any) => (
+                <li key={p.permission} style={{ color: p.state === 'granted' ? 'var(--text-main)' : 'var(--text-muted)' }}>
+                  <span style={{
+                    display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%',
+                    background: p.state === 'granted' ? 'var(--state-healthy)' : 'var(--state-warning)',
+                    marginRight: '6px',
+                  }} />
+                  {p.permission} <span style={{ color: 'var(--text-muted)', fontSize: '10px' }}>({p.state})</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {/* Inventory */}
+      <div>
+        <h4 style={{ margin: '4px 0', fontSize: '13px' }}>
+          Installed packages ({apps?.apps?.length ?? 0})
+          <input
+            type="text"
+            placeholder="Filter…"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            style={{ marginLeft: '8px', padding: '4px 8px', fontSize: '11px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--bg-color)', color: 'var(--text-main)' }}
+            data-testid="agent-filter"
+          />
+        </h4>
+        <div style={{ maxHeight: '200px', overflowY: 'auto', border: '1px solid var(--border)', borderRadius: '4px' }}>
+          {filteredApps.slice(0, 200).map((a: any) => (
+            <div
+              key={a.package + (a.path || '')}
+              style={{
+                padding: '4px 8px',
+                borderBottom: '1px solid var(--border)',
+                fontSize: '11px',
+                display: 'flex',
+                justifyContent: 'space-between',
+                gap: '8px',
+              }}
+            >
+              <span>{a.package}</span>
+              <span style={{
+                color: a.classification === 'system' ? 'var(--text-muted)' :
+                       a.classification === 'user' ? 'var(--state-healthy)' : 'var(--text-muted)',
+                fontSize: '10px',
+              }}>{a.classification}</span>
+            </div>
+          ))}
+          {filteredApps.length > 200 && (
+            <div style={{ padding: '6px', fontSize: '10px', color: 'var(--text-muted)', textAlign: 'center' }}>
+              +{filteredApps.length - 200} more (refine the filter)
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Photo picker test — host-side helper, no exfiltration */}
+      <div>
+        <h4 style={{ margin: '4px 0', fontSize: '13px' }}>Photo / media test</h4>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <input
+            id="agent-test-image-path"
+            type="text"
+            placeholder="Path to a test image (e.g. C:\Users\you\Desktop\test.png)"
+            style={{ flex: 1, padding: '6px 8px', fontSize: '12px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--bg-color)', color: 'var(--text-main)' }}
+          />
+          <button
+            className="secondary-btn"
+            onClick={async () => {
+              const el = document.getElementById('agent-test-image-path') as HTMLInputElement | null;
+              const path = el?.value || '';
+              if (!path) { setPickerMsg('enter a path first'); return; }
+              const r = window.electronAPI.photoPickerTest
+                ? await window.electronAPI.photoPickerTest(device.id, path)
+                : { ok: false, message: 'unsupported' };
+              setPickerMsg(r.message || (r.ok ? 'ok' : 'failed'));
+            }}
+            disabled={busy}
+            style={{ padding: '4px 10px', fontSize: '12px' }}
+            data-testid="agent-push-image"
+          >
+            Push &amp; test
+          </button>
+        </div>
+        {pickerMsg && (
+          <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
+            {pickerMsg}
+          </div>
+        )}
+        <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '4px' }}>
+          Pushes the file to <code>/data/local/tmp/</code> on the device and broadcasts
+          the path to the companion. The file stays on device. No upload, no
+          exfiltration. Useful for testing a photo-picker-style flow without
+          granting storage permissions.
+        </div>
+      </div>
+    </div>
+  );
+};
 
 export default DeviceDetailModal;

@@ -88,6 +88,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('diff-against-baseline', payload),
   getCrashClusters: () => ipcRenderer.invoke('get-crash-clusters'),
   getDiffs: () => ipcRenderer.invoke('get-diffs'),
+
+  // Phase 5 (this PR): Device Agent host-side
+  getAgentStatus: (deviceId: string, pkg: string) => ipcRenderer.invoke('get-agent-status', deviceId, pkg),
+  getInstalledApps: (deviceId: string) => ipcRenderer.invoke('get-installed-apps', deviceId),
+  getGrantedPermissions: (deviceId: string, pkg: string) => ipcRenderer.invoke('get-granted-permissions', deviceId, pkg),
+  photoPickerTest: (deviceId: string, imagePath: string) => ipcRenderer.invoke('photo-picker-test', deviceId, imagePath),
 });
 
 

@@ -179,6 +179,12 @@ declare global {
         Promise<{ success?: boolean; error?: string; result?: any; clusterKey?: string }>;
       getCrashClusters?: () => Promise<{ totalRecords: number; clusters: any[] }>;
       getDiffs?: () => Promise<{ clusters: any[] }>;
+
+      // Phase 5 (this PR): Device Agent host-side
+      getAgentStatus?: (deviceId: string, pkg: string) => Promise<{ ok: boolean; status?: any; error?: string }>;
+      getInstalledApps?: (deviceId: string) => Promise<{ ok: boolean; apps: Array<{ package: string; path: string | null; classification: 'system' | 'user' | 'unknown' }>; error?: string }>;
+      getGrantedPermissions?: (deviceId: string, pkg: string) => Promise<{ ok: boolean; permissions: any[]; error?: string }>;
+      photoPickerTest?: (deviceId: string, imagePath: string) => Promise<{ ok: boolean; message: string }>;
     };
   }
 }

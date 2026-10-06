@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { fork, ChildProcess, spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
+import './adbResolver.js';
+import { resolveAdbExecutable } from './adbResolver.js';
 const execFileAsync = promisify(execFile);
 import adbkit from '@devicefarmer/adbkit';
 const Adb = (adbkit as any).Adb || (adbkit as any).default?.Adb || (adbkit as any).default || adbkit;
@@ -54,11 +56,89 @@ const ADAPTIVE_CAP_BUDGET_KBPS = 480_000; // USB 2.0 hi-speed nominal
 let reconnectScheduler: Scheduler | null = null;
 
 // Phase 5: regression + screenshot diff + crash aggregation state.
+import {
+  diffAgainstGolden,
+  imageToPHashBuffer,
+  clusterKey as diffClusterKey,
+} from './screencapDiff.js';
+import type { DiffResult } from './screencapDiff.js';
+import {
+  startCrashLogcat,
+  clusterCrashes,
+} from './crashAggregator.js';
+import type { CrashRecord } from './crashAggregator.js';
+
 let regressionScheduler: Scheduler | null = null;
 const goldenBaselines: Map<string, { package: string; scenario: string; deviceFingerprint: string; pHash: bigint; grayscale: Uint8Array; width: number; height: number; capturedAt: number }> = new Map();
 const crashRecords: CrashRecord[] = [];
-let crashLogcatTail: { stop: () => void } | null = null;
+const crashLogcatTails: Map<string, { stop: () => void }> = new Map();
 const CRASH_RETENTION_MS = 24 * 60 * 60_000; // keep 24h of records in memory
+
+function ensureCrashLogcatTail(serial: string) {
+  if (crashLogcatTails.has(serial)) return;
+  const physId = `phys_${serial}`;
+  console.log(`[Phase 5] starting crash logcat tail for ${physId}`);
+  try {
+    const tail = startCrashLogcat(serial, physId, (rec) => {
+      crashRecords.push(rec);
+      const cutoff = Date.now() - CRASH_RETENTION_MS;
+      while (crashRecords.length > 0 && crashRecords[0].observedAt < cutoff) {
+        crashRecords.shift();
+      }
+      if (rec.source === 'logcat-am_crash') {
+        captureBugreportAsync(serial).catch(() => { /* best-effort */ });
+      }
+    });
+    crashLogcatTails.set(serial, tail);
+  } catch (err) {
+    console.warn(`[Phase 5] failed to start crash logcat tail for ${serial}:`, err);
+  }
+}
+
+async function handleSetGoldenBaseline(payload: { package: string; scenario: string; deviceFingerprint: string; imageBase64: string }) {
+  const buf = Buffer.from(payload.imageBase64, 'base64');
+  const { grayscale8x8, fullGrayscale, width, height } = imageToPHashBuffer(buf);
+  const pHash = (() => {
+    let h = 0n;
+    let sum = 0;
+    for (let i = 0; i < grayscale8x8.length; i++) sum += grayscale8x8[i];
+    const mean = sum / grayscale8x8.length;
+    for (let i = 0; i < grayscale8x8.length; i++) {
+      if (grayscale8x8[i] >= mean) h |= (1n << BigInt(grayscale8x8.length - 1 - i));
+    }
+    return h;
+  })();
+  const key = `${payload.package}|${payload.scenario}|${payload.deviceFingerprint}`;
+  goldenBaselines.set(key, {
+    package: payload.package,
+    scenario: payload.scenario,
+    deviceFingerprint: payload.deviceFingerprint,
+    pHash,
+    grayscale: fullGrayscale,
+    width,
+    height,
+    capturedAt: Date.now(),
+  });
+  console.log(`[Phase 5] golden baseline set: ${key} (${buf.length} bytes)`);
+  return { success: true, key };
+}
+
+async function handleDiffAgainstBaseline(payload: { package: string; scenario: string; deviceFingerprint: string; deviceSerial: string; imageBase64: string; capturePath?: string }) {
+  const buf = Buffer.from(payload.imageBase64, 'base64');
+  const { grayscale8x8, fullGrayscale, width, height } = imageToPHashBuffer(buf);
+  let h = 0n;
+  let sum = 0;
+  for (let i = 0; i < grayscale8x8.length; i++) sum += grayscale8x8[i];
+  const mean = sum / grayscale8x8.length;
+  for (let i = 0; i < grayscale8x8.length; i++) {
+    if (grayscale8x8[i] >= mean) h |= (1n << BigInt(grayscale8x8.length - 1 - i));
+  }
+  const key = `${payload.package}|${payload.scenario}|${payload.deviceFingerprint}`;
+  const golden = goldenBaselines.get(key);
+  if (!golden) return { error: `no golden baseline for ${key}` };
+  const result: DiffResult = diffAgainstGolden(fullGrayscale, h, width, height, golden, payload.deviceSerial, payload.capturePath);
+  return { success: true, result, clusterKey: diffClusterKey(result) };
+}
 
 function broadcastDelta(deviceId: string, patch: Partial<DeviceData>, removed = false) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -305,6 +385,12 @@ app.whenReady().then(() => {
       if (!healthMonitor) return { evaluated: 0, transitions: 0 };
       return healthMonitor.tick();
     },
+    setGoldenBaseline: handleSetGoldenBaseline,
+    diffAgainstBaseline: handleDiffAgainstBaseline,
+    getCrashClusters: async () => {
+      const clusters = clusterCrashes(crashRecords);
+      return { totalRecords: crashRecords.length, clusters };
+    },
     runNetworkPreflight: async (deviceId, opts = {}) => {
       const dev = deviceStore.getDevice(deviceId);
       const physId = dev?.physicalDeviceId || `phys_${dev?.serial || deviceId}`;
@@ -354,29 +440,10 @@ async function startAdbTracker() {
       const existingDevices = await client.listDevices();
       console.log(`[Startup] Found ${existingDevices.length} already-connected device(s):`, existingDevices.map((d: any) => `${d.id}(${d.type})`).join(', '));
 
-      // Phase 5: kick off the long-running crash/ANR logcat tail on the first
-      // 'device'-type entry we see. We do NOT poll; the child process streams
-      // crash+events buffer lines into our `crashRecords` accumulator.
-      const firstOnline = existingDevices.find((d: any) => d.type === 'device');
-      if (firstOnline && !crashLogcatTail) {
-        const serial = firstOnline.id;
-        const physId = `phys_${serial}`;
-        console.log(`[Phase 5] starting crash logcat tail for ${physId}`);
-        try {
-          crashLogcatTail = startCrashLogcat(serial, physId, (rec) => {
-            crashRecords.push(rec);
-            // Trim retention window.
-            const cutoff = Date.now() - CRASH_RETENTION_MS;
-            while (crashRecords.length > 0 && crashRecords[0].observedAt < cutoff) {
-              crashRecords.shift();
-            }
-            // On an actual crash (not an ANR / non-fatal) trigger bugreport.
-            if (rec.source === 'logcat-am_crash') {
-              captureBugreportAsync(serial).catch(() => { /* best-effort */ });
-            }
-          });
-        } catch (err) {
-          console.warn('[Phase 5] failed to start crash logcat tail:', err);
+      // Phase 5: kick off the long-running crash/ANR logcat tail on all online devices.
+      for (const d of existingDevices) {
+        if (d.type === 'device') {
+          ensureCrashLogcatTail(d.id);
         }
       }
 
@@ -444,11 +511,14 @@ async function startAdbTracker() {
 
       if (device.type === 'device' || device.type === 'unauthorized') {
         queueWorker(device.id, device.type);
+        if (device.type === 'device') ensureCrashLogcatTail(device.id);
       }
     });
 
     tracker.on('remove', async (device: any) => {
       console.log('Device removed:', device.id);
+      crashLogcatTails.get(device.id)?.stop();
+      crashLogcatTails.delete(device.id);
       const dev = deviceStore.getDevice(device.id);
       const physId = dev?.physicalDeviceId;
       if (physId && healthMonitor) healthMonitor.recordPresence(physId, 'absent');
@@ -1194,7 +1264,7 @@ async function openUrlRobust(deviceId: string, url: string) {
     
   console.log(`[openUrlRobust] Executing am start for ${deviceId}`);
   try {
-    const { stdout, stderr } = await execFileAsync('adb', startArgs);
+    const { stdout, stderr } = await execFileAsync(resolveAdbExecutable(), startArgs);
     if (stdout.includes('Error:') || stdout.includes('Error type')) {
       throw new Error(stdout.trim());
     }
@@ -2078,17 +2148,15 @@ import { getAdaptiveConcurrencyCap, estimateFleetBandwidthKbps } from './power.j
 // Phase 5: regression orchestration + screenshot diff + crash aggregation.
 import { runRegressionWithLease } from './regression.js';
 import type { RegressionSpec } from './regression.js';
+// Phase 5 (this PR): minimum-viable Device Agent host-side scaffolding.
 import {
-  diffAgainstGolden,
-  imageToPHashBuffer,
-  clusterKey as diffClusterKey,
-} from './screencapDiff.js';
-import type { DiffResult } from './screencapDiff.js';
-import {
-  startCrashLogcat,
-  clusterCrashes,
-} from './crashAggregator.js';
-import type { CrashRecord } from './crashAggregator.js';
+  getAgentStatus,
+  getInstalledApps,
+  getGrantedPermissions,
+  pushTestImage,
+} from './agent.js';
+// Type-only re-export — exposed for renderer convenience through preload.
+export type { AgentStatus, InstalledApp, PermissionRecord } from './agent.js';
 
 ipcMain.handle('get-expert-mode', () => expertModeEnabled);
 ipcMain.handle('set-expert-mode', (_event, enabled: boolean) => {
@@ -2520,49 +2588,11 @@ ipcMain.handle('run-regression', async (_event, spec: RegressionSpec) => {
 });
 
 ipcMain.handle('set-golden-baseline', async (_event, payload: { package: string; scenario: string; deviceFingerprint: string; imageBase64: string }) => {
-  const buf = Buffer.from(payload.imageBase64, 'base64');
-  const { grayscale8x8, fullGrayscale, width, height } = imageToPHashBuffer(buf);
-  const pHash = (() => {
-    // Use the 8x8 grayscale as the canonical pHash input.
-    let h = 0n;
-    let sum = 0;
-    for (let i = 0; i < grayscale8x8.length; i++) sum += grayscale8x8[i];
-    const mean = sum / grayscale8x8.length;
-    for (let i = 0; i < grayscale8x8.length; i++) {
-      if (grayscale8x8[i] >= mean) h |= (1n << BigInt(grayscale8x8.length - 1 - i));
-    }
-    return h;
-  })();
-  const key = `${payload.package}|${payload.scenario}|${payload.deviceFingerprint}`;
-  goldenBaselines.set(key, {
-    package: payload.package,
-    scenario: payload.scenario,
-    deviceFingerprint: payload.deviceFingerprint,
-    pHash,
-    grayscale: fullGrayscale,
-    width,
-    height,
-    capturedAt: Date.now(),
-  });
-  console.log(`[Phase 5] golden baseline set: ${key} (${buf.length} bytes)`);
-  return { success: true, key };
+  return handleSetGoldenBaseline(payload);
 });
 
 ipcMain.handle('diff-against-baseline', async (_event, payload: { package: string; scenario: string; deviceFingerprint: string; deviceSerial: string; imageBase64: string; capturePath?: string }) => {
-  const buf = Buffer.from(payload.imageBase64, 'base64');
-  const { grayscale8x8, fullGrayscale, width, height } = imageToPHashBuffer(buf);
-  let h = 0n;
-  let sum = 0;
-  for (let i = 0; i < grayscale8x8.length; i++) sum += grayscale8x8[i];
-  const mean = sum / grayscale8x8.length;
-  for (let i = 0; i < grayscale8x8.length; i++) {
-    if (grayscale8x8[i] >= mean) h |= (1n << BigInt(grayscale8x8.length - 1 - i));
-  }
-  const key = `${payload.package}|${payload.scenario}|${payload.deviceFingerprint}`;
-  const golden = goldenBaselines.get(key);
-  if (!golden) return { error: `no golden baseline for ${key}` };
-  const result: DiffResult = diffAgainstGolden(fullGrayscale, h, width, height, golden, payload.deviceSerial, payload.capturePath);
-  return { success: true, result, clusterKey: diffClusterKey(result) };
+  return handleDiffAgainstBaseline(payload);
 });
 
 ipcMain.handle('get-crash-clusters', async () => {
@@ -2573,6 +2603,62 @@ ipcMain.handle('get-crash-clusters', async () => {
 ipcMain.handle('get-diffs', async () => {
   // No persistent per-call history; the IPC is here for parity with crashes.
   return { clusters: [] };
+});
+
+// ----- Phase 5 (this PR): Device Agent host-side IPC -----
+
+function resolveDeviceTransportId(deviceId: string): string | null {
+  // deviceId may be a transport id (e.g. "127.0.0.1:5555") or a physical id
+  // (e.g. "phys_106293738O006649"). The agent runs `adb -s <transport>` so
+  // we resolve to whatever adb actually knows.
+  const dev = deviceStore.getDevice(deviceId);
+  if (dev?.id) return dev.id;
+  const mapping = deviceStore.getPhysicalMapping(deviceId);
+  if (mapping?.currentTransportId) return mapping.currentTransportId;
+  if (deviceId.startsWith('phys_')) return null;
+  return deviceId;
+}
+
+ipcMain.handle('get-agent-status', async (_event, deviceId: string, pkg: string) => {
+  const adbSerial = resolveDeviceTransportId(deviceId);
+  if (!adbSerial) return { ok: false, error: 'unknown device' };
+  try {
+    const status = await getAgentStatus(adbSerial, pkg);
+    return { ok: true, status };
+  } catch (err: any) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+});
+
+ipcMain.handle('get-installed-apps', async (_event, deviceId: string) => {
+  const adbSerial = resolveDeviceTransportId(deviceId);
+  if (!adbSerial) return { ok: false, error: 'unknown device', apps: [] };
+  try {
+    const apps = await getInstalledApps(adbSerial);
+    return { ok: true, apps };
+  } catch (err: any) {
+    return { ok: false, error: err?.message || String(err), apps: [] };
+  }
+});
+
+ipcMain.handle('get-granted-permissions', async (_event, deviceId: string, pkg: string) => {
+  const adbSerial = resolveDeviceTransportId(deviceId);
+  if (!adbSerial) return { ok: false, error: 'unknown device', permissions: [] };
+  try {
+    const permissions = await getGrantedPermissions(adbSerial, pkg);
+    return { ok: true, permissions };
+  } catch (err: any) {
+    return { ok: false, error: err?.message || String(err), permissions: [] };
+  }
+});
+
+ipcMain.handle('photo-picker-test', async (_event, deviceId: string, imagePath: string) => {
+  const adbSerial = resolveDeviceTransportId(deviceId);
+  if (!adbSerial) return { ok: false, message: 'unknown device' };
+  if (typeof imagePath !== 'string' || !imagePath || imagePath.includes('..')) {
+    return { ok: false, message: 'invalid image path' };
+  }
+  return pushTestImage(adbSerial, imagePath);
 });
 
 async function captureBugreportAsync(adbSerial: string): Promise<void> {
